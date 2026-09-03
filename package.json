@@ -5,13 +5,22 @@
   "type": "module",
   "description": "Collect, triage and archive articles. Cloudflare Workers + D1 + R2.",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "dev:frontend": "vite",
+    "dev:worker": "wrangler dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "vite build && wrangler deploy",
     "db:local": "wrangler d1 execute neatinfo --local --file=./schema.sql",
     "db:remote": "wrangler d1 execute neatinfo --remote --file=./schema.sql",
     "seed:local": "wrangler d1 execute neatinfo --local --file=./seed.sql"
   },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
   "devDependencies": {
+    "@vitejs/plugin-react": "^4.4.1",
+    "vite": "^6.3.5",
     "wrangler": "^3.90.0"
   }
 }

@@ -5,7 +5,7 @@ compatibility_date = "2026-01-15"
 # Static frontend served by the same Worker, so there is one deploy and no
 # cross-origin dance between Pages and the API.
 [assets]
-directory = "./public"
+directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
 
