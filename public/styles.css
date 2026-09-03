@@ -38,6 +38,10 @@
 
 * { box-sizing: border-box; }
 
+/* Class rules below set display on these elements, which would otherwise beat
+   the UA [hidden] rule. Everything toggled from app.js relies on this. */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
 }
@@ -691,7 +695,8 @@ a:hover { color: var(--slate-link-hover); text-decoration: underline; }
     flex: 1;
     min-width: 0;
   }
-  .reader[hidden] { display: flex; }
+  /* The empty reader column stays on screen on desktop. */
+  .reader[hidden] { display: flex !important; }
 
   .reader-bar { padding: 16px 32px; }
   .reader-back { display: none; }
