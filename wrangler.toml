@@ -1,0 +1,27 @@
+name = "neatinfo"
+main = "worker/index.js"
+compatibility_date = "2026-01-15"
+
+# Static frontend served by the same Worker, so there is one deploy and no
+# cross-origin dance between Pages and the API.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# Metadata, body text, notes and events. Small, queryable, FTS5.
+[[d1_databases]]
+binding = "DB"
+database_name = "neatinfo"
+database_id = "b04836bd-d5bc-4040-9c79-f1f583c75678"
+
+# Raw page HTML only. 200KB-2MB each would blow past D1's free tier within a
+# year; R2 gives 10GB free with free egress. §5.2
+# Optional: delete this block and articles still save, just without raw capture.
+[[r2_buckets]]
+binding = "RAW"
+bucket_name = "neatinfo-raw"
+
+# Secrets, set with `wrangler secret put <NAME>` -- never in this file:
+#   PASSPHRASE      the single shared passphrase
+#   SESSION_SECRET  random string used to sign the session cookie

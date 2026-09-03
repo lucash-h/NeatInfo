@@ -1,0 +1,17 @@
+{
+  "name": "neatinfo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Collect, triage and archive articles. Cloudflare Workers + D1 + R2.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 execute neatinfo --local --file=./schema.sql",
+    "db:remote": "wrangler d1 execute neatinfo --remote --file=./schema.sql",
+    "seed:local": "wrangler d1 execute neatinfo --local --file=./seed.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
