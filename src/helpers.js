@@ -56,3 +56,65 @@ export function lapseInfo(article, lapseWindowDays) {
     urgent: left <= 4,
   };
 }
+
+// ------------------------------------------------------- archive filters
+//
+// §3 "Store" lists date range, source, tag, status and favorite. Every one of
+// them is a server-side filter without exception -- Starred included, which
+// used to be a client-side pass over whatever page had loaded and therefore
+// lied past the first page. The mapping from UI state to query string lives
+// here, in plain JS, so it can be tested without rendering React.
+
+export const EMPTY_FILTERS = {
+  status: 'all',
+  favorite: false,
+  source: '',
+  tag: '',
+  from: '',
+  to: '',
+};
+
+// A page small enough to paint instantly; "Load more" walks the rest. §2.2
+export const ARCHIVE_PAGE = 50;
+
+export function archiveQueryString({
+  dayStart,
+  filter = 'all',
+  query = '',
+  filters = EMPTY_FILTERS,
+  surface = 'archive',
+  offset = 0,
+  limit = ARCHIVE_PAGE,
+}) {
+  const params = new URLSearchParams({ dayStart, filter, q: query });
+  const f = { ...EMPTY_FILTERS, ...filters };
+
+  if (f.status && f.status !== 'all') params.set('status', f.status);
+  // Starred is a surface in the nav and a filter on the wire.
+  if (f.favorite || surface === 'starred') params.set('favorite', '1');
+  if (f.source) params.set('source', f.source);
+  if (f.tag) params.set('tag', f.tag);
+  if (f.from) params.set('from', f.from);
+  if (f.to) params.set('to', f.to);
+
+  params.set('limit', String(limit));
+  if (offset) params.set('offset', String(offset));
+
+  return params.toString();
+}
+
+// What the archive says it is filtered by, so "N of M" is never mysterious.
+// Returns one entry per active filter, each clearable on its own.
+export function activeFilters(filters = EMPTY_FILTERS, surface = 'archive') {
+  const f = { ...EMPTY_FILTERS, ...filters };
+  const out = [];
+  if (f.status && f.status !== 'all') out.push({ key: 'status', label: f.status });
+  // On Starred the favorite filter is the surface itself, so it is not
+  // offered as something to clear.
+  if (f.favorite && surface !== 'starred') out.push({ key: 'favorite', label: 'starred' });
+  if (f.source) out.push({ key: 'source', label: f.source });
+  if (f.tag) out.push({ key: 'tag', label: '#' + f.tag });
+  if (f.from) out.push({ key: 'from', label: 'from ' + f.from });
+  if (f.to) out.push({ key: 'to', label: 'to ' + f.to });
+  return out;
+}

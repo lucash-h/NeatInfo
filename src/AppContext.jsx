@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import { api, localDayStart, ApiError } from './api';
 import { getPlayer } from './tts';
+import { ARCHIVE_PAGE, EMPTY_FILTERS, archiveQueryString } from './helpers';
 
 const AppContext = createContext();
 
@@ -13,11 +14,21 @@ const EMPTY_FEED = {
   pendingTotal: 0, archiveTotal: 0, lapseWindowDays: 14,
 };
 
+const EMPTY_FACETS = { sources: [], tags: [], earliestAddedAt: null };
+
 export function AppProvider({ children }) {
   const [feed, setFeed] = useState(EMPTY_FEED);
   const [surface, setSurface] = useState('today');
   const [filter, setFilter] = useState('all');
   const [query, setQuery] = useState('');
+  // §3 "Store" filters. They are server-side, so they live next to the feed
+  // rather than being applied to whatever rows happen to be loaded.
+  const [filters, setFilters] = useState(EMPTY_FILTERS);
+  const [facets, setFacets] = useState(EMPTY_FACETS);
+  // The archive is paged, so its rows accumulate across "Load more" while the
+  // rest of the feed is replaced wholesale on every load.
+  const [archiveRows, setArchiveRows] = useState([]);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [openArticle, setOpenArticle] = useState(null);
   const [toastMsg, setToastMsg] = useState(null);
   const toastTimer = useRef();
@@ -54,25 +65,91 @@ export function AppProvider({ children }) {
     return () => window.removeEventListener('unhandledrejection', onRejection);
   }, [toast]);
 
+  // Any load is page one: a filter or a search that kept the old offset would
+  // show a slice of a result set the user is no longer looking at.
   const load = useCallback((opts = {}) => guard(async () => {
-    const searchQuery = opts.query ?? query;
-    const searchFilter = opts.filter ?? filter;
-    const params = new URLSearchParams({
+    const params = archiveQueryString({
       dayStart: localDayStart(),
-      filter: searchFilter,
-      q: searchQuery,
+      filter: opts.filter ?? filter,
+      query: opts.query ?? query,
+      filters: opts.filters ?? filters,
+      surface: opts.surface ?? surface,
+      offset: 0,
+      limit: ARCHIVE_PAGE,
     });
     const data = await api(`/api/feed?${params}`);
     setFeed(data);
+    setArchiveRows(data.archive);
     return data;
-  }, 'Could not load the feed.'), [query, filter, guard]);
+  }, 'Could not load the feed.'), [query, filter, filters, surface, guard]);
+
+  // The next page, appended. The total beside the rows is the server's
+  // filtered count, so "N of M" stays honest however far down this goes. §2.2
+  const loadMore = useCallback(() => guard(async () => {
+    if (loadingMore) return undefined;
+    setLoadingMore(true);
+    try {
+      const params = archiveQueryString({
+        dayStart: localDayStart(),
+        filter,
+        query,
+        filters,
+        surface,
+        offset: archiveRows.length,
+        limit: ARCHIVE_PAGE,
+      });
+      const data = await api(`/api/feed?${params}`);
+      // A row already on screen must not appear twice if something was
+      // archived between the two reads.
+      const seen = new Set(archiveRows.map((a) => a.id));
+      setFeed((prev) => ({ ...prev, archiveTotal: data.archiveTotal }));
+      setArchiveRows((prev) => [...prev, ...data.archive.filter((a) => !seen.has(a.id))]);
+      return data;
+    } finally {
+      setLoadingMore(false);
+    }
+  }, 'Could not load more.'), [archiveRows, filter, query, filters, surface, loadingMore, guard]);
+
+  // The filter bar needs the whole archive's sources and tags, not one page's.
+  const loadFacets = useCallback(() => guard(async () => {
+    const data = await api('/api/facets');
+    setFacets(data);
+    return data;
+  }, 'Could not load the filter options.'), [guard]);
+
+  // One filter changed: merge it in and re-read from page one.
+  const setArchiveFilter = useCallback((patch) => {
+    const next = { ...filters, ...patch };
+    setFilters(next);
+    load({ filters: next });
+  }, [filters, load]);
+
+  const clearFilters = useCallback(() => {
+    setFilters(EMPTY_FILTERS);
+    setQuery('');
+    load({ filters: EMPTY_FILTERS, query: '' });
+  }, [load]);
 
   const switchSurface = useCallback((name) => {
     getPlayer().stop();
     setSurface(name);
     setQuery('');
+    setFilters(EMPTY_FILTERS);
     setOpenArticle(null);
-  }, []);
+    // Starred is favorite=1 server-side, so leaving Archive changes the query
+    // as well as the tab -- the rows have to be re-read either way.
+    load({ surface: name, query: '', filters: EMPTY_FILTERS });
+  }, [load]);
+
+  // A tag in the rail is a filter, not decoration. §3 "Store"
+  const showTag = useCallback((tag) => {
+    getPlayer().stop();
+    setSurface('archive');
+    setOpenArticle(null);
+    const next = { ...EMPTY_FILTERS, tag };
+    setFilters(next);
+    load({ surface: 'archive', filters: next, query });
+  }, [load, query]);
 
   const open = useCallback((id) => guard(async () => {
     const { article } = await api(`/api/articles/${id}`);
@@ -153,9 +230,10 @@ export function AppProvider({ children }) {
   const currentList = useCallback(() => {
     if (surface === 'today') return feed.today;
     if (surface === 'pending') return feed.pending;
-    if (surface === 'starred') return feed.archive.filter(a => a.favorite);
-    return feed.archive;
-  }, [surface, feed]);
+    // Starred filtered the loaded page here once, which made it wrong as soon
+    // as there was more than one page. The server does it now.
+    return archiveRows;
+  }, [surface, feed, archiveRows]);
 
   const step = useCallback((delta) => {
     const list = currentList();
@@ -167,7 +245,9 @@ export function AppProvider({ children }) {
 
   const value = {
     feed, surface, filter, query, openArticle, toastMsg,
-    load, switchSurface, setFilter, setQuery, open, close,
+    filters, facets, archiveRows, loadingMore,
+    load, loadMore, loadFacets, setArchiveFilter, clearFilters, showTag,
+    switchSurface, setFilter, setQuery, open, close,
     resolve, toggleStar, saveNote, toast, step, currentList,
     fillArticle, refetch,
   };

@@ -1,6 +1,9 @@
 // Card metadata and the lapse countdown the Pending surface shows. §2.4, §3
 import { describe, expect, it } from 'vitest';
-import { ageLabel, daysSince, lapseInfo, metaLine, needsText, readMinutes } from '../src/helpers.js';
+import {
+  ageLabel, daysSince, lapseInfo, metaLine, needsText, readMinutes,
+  ARCHIVE_PAGE, EMPTY_FILTERS, activeFilters, archiveQueryString
+} from '../src/helpers.js';
 import { isoDaysAgo } from './helpers.js';
 
 describe('readMinutes', () => {
@@ -98,5 +101,66 @@ describe('needsText', () => {
     // article that already has text would be worse than not offering.
     expect(needsText({ id: 1, fetch_status: 'ok' })).toBe(false);
     expect(needsText(null)).toBe(false);
+  });
+});
+
+// The filter bar's controls are React and cannot run in this pool, but the
+// mapping from its state to the server's filters is plain JS and is where the
+// mistakes would be. §3 "Store"
+describe('archiveQueryString', () => {
+  const parse = (qs) => Object.fromEntries(new URLSearchParams(qs));
+
+  it('sends only the filters that are on', () => {
+    const q = parse(archiveQueryString({ dayStart: 'D' }));
+    expect(q).toEqual({ dayStart: 'D', filter: 'all', q: '', limit: String(ARCHIVE_PAGE) });
+  });
+
+  it('turns the Starred surface into favorite=1 rather than a client filter', () => {
+    expect(parse(archiveQueryString({ dayStart: 'D', surface: 'starred' })).favorite).toBe('1');
+    expect(parse(archiveQueryString({ dayStart: 'D', surface: 'archive' })).favorite).toBeUndefined();
+  });
+
+  it('carries every §3 filter', () => {
+    const q = parse(archiveQueryString({
+      dayStart: 'D',
+      query: 'scaling',
+      filters: {
+        ...EMPTY_FILTERS,
+        status: 'kept', favorite: true, source: 'arxiv.org',
+        tag: 'ml', from: '2026-01-01', to: '2026-02-01'
+      }
+    }));
+    expect(q).toMatchObject({
+      q: 'scaling', status: 'kept', favorite: '1', source: 'arxiv.org',
+      tag: 'ml', from: '2026-01-01', to: '2026-02-01'
+    });
+  });
+
+  it('omits the status when it is "all"', () => {
+    const q = parse(archiveQueryString({ dayStart: 'D', filters: { ...EMPTY_FILTERS, status: 'all' } }));
+    expect(q.status).toBeUndefined();
+  });
+
+  it('only sends an offset once there is a page behind it', () => {
+    expect(parse(archiveQueryString({ dayStart: 'D', offset: 0 })).offset).toBeUndefined();
+    expect(parse(archiveQueryString({ dayStart: 'D', offset: 50 })).offset).toBe('50');
+  });
+});
+
+describe('activeFilters', () => {
+  it('lists what the archive is filtered by, one clearable entry each', () => {
+    const labels = activeFilters({ ...EMPTY_FILTERS, status: 'lapsed', tag: 'ml', source: 'x.example' })
+      .map((f) => f.label);
+    expect(labels).toEqual(['lapsed', 'x.example', '#ml']);
+  });
+
+  it('says nothing when nothing is filtered', () => {
+    expect(activeFilters(EMPTY_FILTERS)).toEqual([]);
+  });
+
+  it('does not offer to clear the favorite filter on the Starred surface', () => {
+    const f = { ...EMPTY_FILTERS, favorite: true };
+    expect(activeFilters(f, 'archive').map((x) => x.key)).toEqual(['favorite']);
+    expect(activeFilters(f, 'starred')).toEqual([]);
   });
 });

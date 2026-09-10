@@ -11,7 +11,7 @@ import SettingsSheet from './components/SettingsSheet';
 import Toast from './components/Toast';
 
 function Shell() {
-  const { feed, surface, switchSurface, load, openArticle, step, resolve, close } = useApp();
+  const { feed, surface, switchSurface, load, openArticle, step, resolve, close, showTag, filters, archiveRows } = useApp();
   const [addOpen, setAddOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
@@ -60,10 +60,12 @@ function Shell() {
     }
   }, []);
 
-  // Collect tags across all feeds
+  // Collect tags across the loaded surfaces. The archive's own tag list comes
+  // from /api/facets (it covers rows no page has loaded); this rail is the
+  // shortcut to whatever is currently in view.
   const tags = new Set();
-  ['today', 'pending', 'archive'].forEach(k => {
-    feed[k].forEach(a => (a.tags || []).forEach(t => tags.add(t)));
+  [feed.today, feed.pending, archiveRows].forEach(list => {
+    list.forEach(a => (a.tags || []).forEach(t => tags.add(t)));
   });
 
   const surfaceComponent = {
@@ -108,7 +110,15 @@ function Shell() {
         <div className="rail-tags">
           <span className="eyebrow">Tags</span>
           <div className="tag-row">
-            {[...tags].sort().slice(0, 12).map(t => <span key={t} className="tag">{t}</span>)}
+            {/* A tag is a filter on the archive, not a label. §3 "Store" */}
+            {[...tags].sort().slice(0, 12).map(t => (
+              <button
+                key={t}
+                className="tag"
+                aria-pressed={String(filters.tag === t)}
+                onClick={() => showTag(t)}
+              >{t}</button>
+            ))}
           </div>
         </div>
         <div className="rail-foot">

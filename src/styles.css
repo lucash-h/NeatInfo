@@ -384,6 +384,55 @@ a:hover { color: var(--slate-link-hover); text-decoration: underline; }
 
 /* -------------------------------------------------------------- archive */
 
+/* §3 "Store" filters: status chips, a favorite toggle, source and tag selects
+   and a date range. Every control writes a server-side filter. */
+.filterbar {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.filter-selects {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.select {
+  height: 32px;
+  max-width: 100%;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--secondary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.select:focus { outline: none; border-color: var(--slate-tint-border); box-shadow: 0 0 0 3px var(--slate-tint); }
+
+.date-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.archive-count {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+
+.load-more { width: 100%; }
+.load-more[disabled] { opacity: 0.6; cursor: default; }
+
+
 .archive-row {
   display: flex;
   flex-direction: column;
@@ -690,13 +739,22 @@ a:hover { color: var(--slate-link-hover); text-decoration: underline; }
 
   .rail-tags { display: flex; flex-direction: column; gap: 9px; }
   .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  /* A tag is a button now: clicking it filters the archive. §3 "Store" */
   .tag {
     padding: 4px 9px;
     border: 1px solid var(--border);
     border-radius: 999px;
     background: var(--card);
+    font-family: inherit;
     font-size: 11.5px;
     color: var(--secondary);
+    cursor: pointer;
+  }
+  .tag:hover { border-color: var(--slate-tint-border); background: var(--slate-tint); }
+  .tag[aria-pressed="true"] {
+    border-color: var(--slate);
+    background: var(--slate);
+    color: #fff;
   }
 
   .rail-foot { margin-top: auto; display: flex; flex-direction: column; gap: 7px; align-items: flex-start; }
