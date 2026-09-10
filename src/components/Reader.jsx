@@ -1,10 +1,12 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useApp } from '../AppContext';
-import { metaLine } from '../helpers';
+import { metaLine, needsText } from '../helpers';
 import TtsPlayer from './TtsPlayer';
 
 export default function Reader() {
-  const { openArticle: a, close, resolve, toggleStar, saveNote } = useApp();
+  const { openArticle: a, close, resolve, toggleStar, saveNote, fillArticle, refetch } = useApp();
+  const [fillText, setFillText] = useState('');
+  const [busy, setBusy] = useState(false);
   const noteTimer = useRef();
   const pendingNote = useRef(null);
   const saveNoteRef = useRef(saveNote);
@@ -16,6 +18,7 @@ export default function Reader() {
   // now, and a debounced edit is flushed before the article changes under it.
   useEffect(() => {
     setNoteValue(a?.notes || '');
+    setFillText('');
     return () => {
       clearTimeout(noteTimer.current);
       const queued = pendingNote.current;
@@ -99,8 +102,45 @@ export default function Reader() {
             paragraphs.map((p, i) => <p key={i} className="para">{p}</p>)
           ) : (
             <p className="card-summary">
-              {a.summary || 'No text was captured for this one. Open the original, or add it again by pasting the text.'}
+              {a.summary || 'No text was captured for this one.'}
             </p>
+          )}
+
+          {/* Never a dead end: an item whose fetch failed is completed here,
+              by retrying or by pasting the text. §3 "Pull" */}
+          {needsText(a) && (
+            <div className="fill-block">
+              <span className="eyebrow">This one has no text yet</span>
+              <p className="field-hint">
+                {a.fetch_status ? `The fetch came back "${a.fetch_status}".` : 'The page was never fetched.'}
+                {' '}Try again, or paste the text in and it fills in this same item — nothing is re-added.
+              </p>
+              {a.url && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy}
+                  onClick={async () => { setBusy(true); await refetch(a.id); setBusy(false); }}
+                >Try fetching again</button>
+              )}
+              <textarea
+                className="input textarea"
+                rows={5}
+                placeholder="Paste the article text"
+                value={fillText}
+                onChange={e => setFillText(e.target.value)}
+              />
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={busy || !fillText.trim()}
+                onClick={async () => {
+                  setBusy(true);
+                  await fillArticle(a.id, { body_text: fillText });
+                  setBusy(false);
+                }}
+              >Save the text</button>
+            </div>
           )}
 
           <div className="note-block">

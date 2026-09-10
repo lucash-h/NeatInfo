@@ -1,5 +1,14 @@
 const DAY_MS = 86400000;
 
+// §3 "Pull": an item whose fetch failed is not a dead end -- it is an item
+// waiting for text. `has_text` comes back on the duplicate payload; a full
+// article carries `body_text` instead.
+export function needsText(article) {
+  if (!article) return false;
+  const hasText = article.has_text ?? Boolean(article.body_text);
+  return !hasText && article.fetch_status !== 'pasted';
+}
+
 export function daysSince(iso) {
   const then = new Date(iso);
   then.setHours(0, 0, 0, 0);

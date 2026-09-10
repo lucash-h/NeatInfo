@@ -282,3 +282,140 @@ describe('raw HTML capture', () => {
     expect(payload.article.title).toBeTruthy();
   });
 });
+
+// Success criterion 6: an article whose fetch failed can be completed in-app,
+// without deleting it and re-adding it. §3 "Pull" -- never a dead end.
+describe('rescuing a failed fetch', () => {
+  async function addFailed(url = 'https://example.com/gone') {
+    stubFetch(async () => new Response('nope', { status: 503 }));
+    const { body } = await add({ url });
+    expect(body.article.fetch_status).toBe('503');
+    return body.article;
+  }
+
+  const patch = (id, payload) =>
+    callJson(`/api/articles/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+
+  it('accepts pasted title, source and body on PATCH and marks the row pasted', async () => {
+    const article = await addFailed();
+    const { status, body } = await patch(article.id, {
+      title: 'The piece I had to paste',
+      source: 'Example Review',
+      body_text: 'Kolmogorov complexity is the length of the shortest program that outputs a string.'
+    });
+
+    expect(status).toBe(200);
+    expect(body.article.title).toBe('The piece I had to paste');
+    expect(body.article.source).toBe('Example Review');
+    expect(body.article.fetch_status).toBe('pasted');
+    expect(body.article.word_count).toBe(13);
+    expect(body.article.summary).toContain('Kolmogorov complexity');
+    expect(body.article.body_text).toContain('shortest program');
+  });
+
+  it('makes the pasted text findable in search', async () => {
+    const article = await addFailed();
+    await patch(article.id, { body_text: 'A note about perovskite solar cells and their stability.' });
+    await callJson(`/api/articles/${article.id}/resolve`, {
+      method: 'POST', body: JSON.stringify({ status: 'kept' })
+    });
+
+    const { body } = await callJson('/api/feed?q=perovskite');
+    expect(body.archive.map((a) => a.id)).toContain(article.id);
+  });
+
+  it('does not overwrite a summary that already exists', async () => {
+    const article = await addFailed();
+    await patch(article.id, { body_text: 'First text, which becomes the summary.' });
+    const first = (await patch(article.id, { body_text: 'Entirely different second text.' })).body.article;
+    expect(first.summary).toContain('First text');
+    expect(first.body_text).toContain('second text');
+  });
+
+  it('ignores blank title and source rather than emptying the row', async () => {
+    const article = await addFailed();
+    const { body } = await patch(article.id, { title: '   ', source: '' });
+    expect(body.article.title).toBe(article.title);
+    expect(body.article.source).toBe('example.com');
+  });
+
+  it('still accepts notes and tags alongside the new fields', async () => {
+    const article = await addFailed();
+    const { body } = await patch(article.id, {
+      body_text: 'Some rescued text about diffusion models.',
+      notes: 'worth revisiting',
+      tags: ['ml', 'ML', ' rescue ']
+    });
+    expect(body.article.notes).toBe('worth revisiting');
+    expect(body.article.tags.sort()).toEqual(['ml', 'rescue']);
+  });
+
+  it('tells the duplicate guard that the existing item still needs text', async () => {
+    await addFailed('https://example.com/twice');
+    stubFetch(async () => new Response('nope', { status: 503 }));
+    const { status, body } = await add({ url: 'https://example.com/twice' });
+
+    // 409 as before -- but now carrying what AddSheet needs to offer the
+    // fill-in instead of only "Open it".
+    expect(status).toBe(409);
+    expect(body.duplicate).toBe(true);
+    expect(body.article.fetch_status).toBe('503');
+    expect(body.article.has_text).toBe(0);
+  });
+
+  it('reports has_text for an item that already has a body', async () => {
+    stubFetch(async () => htmlResponse(page()));
+    await add({ url: 'https://example.com/complete' });
+    const { body } = await add({ url: 'https://example.com/complete' });
+    expect(body.article.has_text).toBe(1);
+  });
+});
+
+describe('POST /api/articles/:id/refetch', () => {
+  const refetch = (id) => callJson(`/api/articles/${id}/refetch`, { method: 'POST' });
+
+  it('fills in an item whose first fetch failed', async () => {
+    stubFetch(async () => new Response('nope', { status: 503 }));
+    const { body: added } = await add({ url: 'https://example.com/flaky' });
+    expect(added.article.fetch_status).toBe('503');
+
+    stubFetch(async () => htmlResponse(page({
+      meta: '<meta property="og:title" content="It worked the second time">'
+    })));
+    const { status, body } = await refetch(added.article.id);
+
+    expect(status).toBe(200);
+    expect(body.fetchError).toBeNull();
+    expect(body.article.fetch_status).toBe('ok');
+    expect(body.article.title).toBe('It worked the second time');
+    expect(body.article.body_text).toContain('forty character floor');
+    expect(body.article.word_count).toBeGreaterThan(10);
+
+    const row = await env.DB.prepare(`SELECT raw_html_key FROM article WHERE id = ?1`)
+      .bind(added.article.id).first();
+    expect(row.raw_html_key).toMatch(/^raw\//);
+  });
+
+  it('keeps the item and reports the error when the retry fails too', async () => {
+    stubFetch(async () => new Response('nope', { status: 503 }));
+    const { body: added } = await add({ url: 'https://example.com/still-down' });
+
+    stubFetch(async () => { throw new Error('connection reset'); });
+    const { status, body } = await refetch(added.article.id);
+
+    expect(status).toBe(200);
+    expect(body.fetchError).toContain('connection reset');
+    expect(body.article.fetch_status).toBe('failed');
+    expect(body.article.id).toBe(added.article.id);
+  });
+
+  it('400s an item that has no URL to fetch', async () => {
+    const { body } = await add({ text: 'Pasted from a paper PDF, no URL at all.' });
+    const { status } = await refetch(body.article.id);
+    expect(status).toBe(400);
+  });
+
+  it('404s an article that does not exist', async () => {
+    expect((await refetch(999999)).status).toBe(404);
+  });
+});

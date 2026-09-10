@@ -618,6 +618,17 @@ a:hover { color: var(--slate-link-hover); text-decoration: underline; }
 }
 .crash-actions { display: flex; gap: 10px; align-items: center; }
 
+.fill-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 14px 0;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px dashed var(--border-strong);
+  background: var(--panel);
+}
+
 .toast {
   position: fixed;
   left: 50%;

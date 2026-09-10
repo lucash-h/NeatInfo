@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { api } from '../api';
 import { useApp } from '../AppContext';
+import { needsText } from '../helpers';
 
 export default function AddSheet({ visible, onClose }) {
-  const { load, switchSurface, toast, open } = useApp();
+  const { load, switchSurface, toast, open, fillArticle } = useApp();
   const [url, setUrl] = useState('');
   const [text, setText] = useState('');
   const [title, setTitle] = useState('');
@@ -12,16 +13,33 @@ export default function AddSheet({ visible, onClose }) {
   const [showPaste, setShowPaste] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [dupArticle, setDupArticle] = useState(null);
+  // Set when the paste is destined for an item that already exists rather than
+  // for a new row -- the case the duplicate guard used to make unreachable.
+  const [fillTarget, setFillTarget] = useState(null);
 
   if (!visible) return null;
 
   function reset() {
     setUrl(''); setText(''); setTitle(''); setSource('');
-    setNotice(null); setShowPaste(false); setDupArticle(null);
+    setNotice(null); setShowPaste(false); setDupArticle(null); setFillTarget(null);
   }
 
   async function handleSubmit(e) {
     e.preventDefault();
+
+    // §3 "Pull": pasting the text of an item whose fetch failed fills in the
+    // existing row instead of being refused as a duplicate.
+    if (fillTarget) {
+      if (!text.trim()) return;
+      setSubmitting(true);
+      const article = await fillArticle(fillTarget.id, { title, source, body_text: text });
+      setSubmitting(false);
+      if (!article) return;
+      reset();
+      onClose();
+      return;
+    }
+
     if (!url && !text) return;
     setSubmitting(true);
     setNotice(null);
@@ -34,8 +52,19 @@ export default function AddSheet({ visible, onClose }) {
       });
 
       if (result.status === 409) {
-        setNotice(`Already here — "${result.article.title}" (${result.article.status}).`);
         setDupArticle(result.article);
+        if (needsText(result.article)) {
+          // Never a dead end, even on the second attempt.
+          setNotice(
+            `Already here — "${result.article.title}" (${result.article.status}), and its text never arrived. ` +
+            `Paste it below and it will fill in that item.`
+          );
+          setFillTarget(result.article);
+          setTitle(result.article.title);
+          setShowPaste(true);
+        } else {
+          setNotice(`Already here — "${result.article.title}" (${result.article.status}).`);
+        }
         load();
         return;
       }
@@ -44,6 +73,7 @@ export default function AddSheet({ visible, onClose }) {
         toast('Added — but the page could not be read');
         setNotice(`${result.fetchError}. The item is saved with its URL; paste the text to fill it in.`);
         setShowPaste(true);
+        setFillTarget(result.article);
         setTitle(result.article.title);
         load();
         return;
@@ -64,6 +94,12 @@ export default function AddSheet({ visible, onClose }) {
   function handleScrimClick(e) {
     if (e.target === e.currentTarget) { reset(); onClose(); }
   }
+
+  const submitLabel = submitting
+    ? (fillTarget ? 'Saving…' : 'Fetching…')
+    : fillTarget ? 'Fill in the existing item'
+    : showPaste ? 'Add article'
+    : 'Fetch and add';
 
   return (
     <div className="sheet-scrim" onClick={handleScrimClick}>
@@ -88,7 +124,7 @@ export default function AddSheet({ visible, onClose }) {
         )}
 
         <button className="btn btn-primary btn-tall" type="submit" disabled={submitting}>
-          {submitting ? 'Fetching…' : (showPaste ? 'Add article' : 'Fetch and add')}
+          {submitLabel}
         </button>
 
         <div className="sheet-alt">

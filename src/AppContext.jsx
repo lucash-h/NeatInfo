@@ -115,6 +115,30 @@ export function AppProvider({ children }) {
     toast('Note saved');
   }, 'Could not save the note.'), [toast, guard]);
 
+  // §3 "Pull": completing a failed fetch by hand, in place.
+  const fillArticle = useCallback((id, fields) => guard(async () => {
+    const { article } = await api(`/api/articles/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(fields),
+    });
+    setOpenArticle(article);
+    toast('Filled in');
+    await load();
+    return article;
+  }, 'Could not save that text.'), [guard, load, toast]);
+
+  const refetch = useCallback((id) => guard(async () => {
+    const result = await api(`/api/articles/${id}/refetch`, { method: 'POST' });
+    if (result.fetchError) {
+      toast(`Still no luck: ${result.fetchError}`);
+    } else {
+      toast('Fetched');
+    }
+    setOpenArticle(result.article);
+    await load();
+    return result;
+  }, 'Could not fetch that again.'), [guard, load, toast]);
+
   const close = useCallback(() => {
     // Closing the reader must silence it, however it was closed -- the Back
     // button, Escape, or switching surface. §6
@@ -141,6 +165,7 @@ export function AppProvider({ children }) {
     feed, surface, filter, query, openArticle, toastMsg,
     load, switchSurface, setFilter, setQuery, open, close,
     resolve, toggleStar, saveNote, toast, step, currentList,
+    fillArticle, refetch,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

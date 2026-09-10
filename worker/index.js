@@ -125,6 +125,37 @@ async function getFeed(env, url) {
 
 // ------------------------------------------------------------------ ingest
 
+// Capture greedily at ingest, process lazily forever after. Raw HTML is the
+// bulky half, so it goes to R2 and never into D1. §5.2 / §5.3
+// Returns the key, or null when the copy could not be kept -- losing the raw
+// copy must never lose the article.
+async function captureRaw(env, html) {
+  if (!env.RAW || !html) return null;
+
+  const htmlBytes = new TextEncoder().encode(html).byteLength;
+  const MAX_FILE = 2 * 1024 * 1024;    // 2 MB per file
+  const BUDGET_GB = 8;                  // stop well before the 10 GB free tier
+  if (htmlBytes > MAX_FILE) return null;
+
+  try {
+    const usage = await env.RAW.head('_usage');
+    const stored = Number(usage?.customMetadata?.bytes || '0');
+    if (stored + htmlBytes > BUDGET_GB * 1024 * 1024 * 1024) return null;
+  } catch {}
+
+  const key = `raw/${Date.now()}-${crypto.randomUUID()}.html`;
+  try {
+    await env.RAW.put(key, html, { httpMetadata: { contentType: 'text/html' } });
+    // Update the running total (V1-19 replaces this read-modify-write).
+    const prev = await env.RAW.head('_usage').catch(() => null);
+    const prevBytes = Number(prev?.customMetadata?.bytes || '0');
+    await env.RAW.put('_usage', '', { customMetadata: { bytes: String(prevBytes + htmlBytes) } });
+    return key;
+  } catch {
+    return null;
+  }
+}
+
 async function addArticle(env, request) {
   const payload = await request.json().catch(() => ({}));
   const rawUrl = (payload.url || '').trim();
@@ -138,7 +169,8 @@ async function addArticle(env, request) {
     if (!normalized) return fail(400, 'That does not look like a web address.');
 
     const existing = await env.DB.prepare(
-      `SELECT id, title, status, resolved_at FROM article WHERE topic_id = ?1 AND url_normalized = ?2`
+      `SELECT id, title, status, resolved_at, fetch_status, body_text IS NOT NULL AS has_text
+       FROM article WHERE topic_id = ?1 AND url_normalized = ?2`
     ).bind(TOPIC_ID, normalized).first();
 
     if (existing) {
@@ -175,38 +207,7 @@ async function addArticle(env, request) {
         raw_html_key: null
       };
 
-      // Capture greedily at ingest, process lazily forever after. Raw HTML is
-      // the bulky half, so it goes to R2 and never into D1. §5.2 / §5.3
-      if (env.RAW && extracted.html) {
-        const htmlBytes = new TextEncoder().encode(extracted.html).byteLength;
-        const MAX_FILE = 2 * 1024 * 1024;    // 2 MB per file
-        const BUDGET_GB = 8;                  // stop well before the 10 GB free tier
-        let withinBudget = htmlBytes <= MAX_FILE;
-
-        if (withinBudget) {
-          try {
-            const usage = await env.RAW.head('_usage');
-            const stored = Number(usage?.customMetadata?.bytes || '0');
-            if (stored + htmlBytes > BUDGET_GB * 1024 * 1024 * 1024) withinBudget = false;
-          } catch {}
-        }
-
-        if (withinBudget) {
-          const key = `raw/${Date.now()}-${crypto.randomUUID()}.html`;
-          try {
-            await env.RAW.put(key, extracted.html, { httpMetadata: { contentType: 'text/html' } });
-            record.raw_html_key = key;
-            // Update running total
-            const prev = await env.RAW.head('_usage').catch(() => null);
-            const prevBytes = Number(prev?.customMetadata?.bytes || '0');
-            await env.RAW.put('_usage', '', {
-              customMetadata: { bytes: String(prevBytes + htmlBytes) }
-            });
-          } catch {
-            // Losing the raw copy must never lose the article.
-          }
-        }
-      }
+      record.raw_html_key = await captureRaw(env, extracted.html);
     } else {
       // A failed fetch still creates the item. Never a dead end. §3 "Pull"
       fetchError = extracted.error;
@@ -304,14 +305,42 @@ async function setStar(env, id, request) {
   return json({ article: shape(row) });
 }
 
+// §3 "Pull" promises the app is never a dead end. That has to hold *after*
+// ingest too: a failed fetch leaves a row with a URL and no text, and the only
+// way to rescue it is to supply the title, source and body here.
 async function updateArticle(env, id, request) {
   const body = await request.json().catch(() => ({}));
   const statements = [];
 
+  const sets = [];
+  const binds = [];
+
   if (typeof body.notes === 'string') {
+    sets.push('notes = ?');
+    binds.push(body.notes);
+  }
+  if (typeof body.title === 'string' && body.title.trim()) {
+    sets.push('title = ?');
+    binds.push(body.title.trim().slice(0, 300));
+  }
+  if (typeof body.source === 'string' && body.source.trim()) {
+    sets.push('source = ?');
+    binds.push(body.source.trim().slice(0, 200));
+  }
+  if (typeof body.body_text === 'string' && body.body_text.trim()) {
+    const text = body.body_text.trim();
+    sets.push('body_text = ?', 'word_count = ?', "fetch_status = 'pasted'", 'fetched_at = ?');
+    binds.push(text, countWords(text), nowIso());
+    // A summary already on the card is not replaced behind the reader's back;
+    // an empty one is filled from the pasted text. §3 "Show"
+    sets.push("summary = CASE WHEN summary IS NULL OR summary = '' THEN ? ELSE summary END");
+    binds.push(summarizeText(text));
+  }
+
+  if (sets.length) {
     statements.push(
-      env.DB.prepare(`UPDATE article SET notes = ?2 WHERE id = ?1 AND topic_id = ?3`)
-        .bind(id, body.notes, TOPIC_ID)
+      env.DB.prepare(`UPDATE article SET ${sets.join(', ')} WHERE id = ? AND topic_id = ?`)
+        .bind(...binds, id, TOPIC_ID)
     );
   }
 
@@ -331,12 +360,61 @@ async function updateArticle(env, id, request) {
 
   if (statements.length) await env.DB.batch(statements);
 
-  const row = await env.DB.prepare(`SELECT ${LIST_COLUMNS} FROM article WHERE id = ?1 AND topic_id = ?2`)
-    .bind(id, TOPIC_ID).first();
+  const row = await env.DB.prepare(
+    `SELECT ${LIST_COLUMNS}, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
+  ).bind(id, TOPIC_ID).first();
   if (!row) return fail(404, 'No such article.');
 
   const [withTag] = await withTags(env, [row]);
   return json({ article: shape(withTag) });
+}
+
+// The other half of "never a dead end": a fetch that failed for a transient
+// reason (a 503, a timeout) is retryable in place, without deleting the item
+// and tripping the duplicate guard on the way back in. §3 "Pull"
+async function refetchArticle(env, id) {
+  const row = await env.DB.prepare(
+    `SELECT id, url_normalized, title, source FROM article WHERE id = ?1 AND topic_id = ?2`
+  ).bind(id, TOPIC_ID).first();
+  if (!row) return fail(404, 'No such article.');
+  if (!row.url_normalized) return fail(400, 'That item has no URL to fetch.');
+
+  const extracted = await extractArticle(row.url_normalized);
+  const ts = nowIso();
+
+  if (!extracted.ok) {
+    await env.DB.prepare(`UPDATE article SET fetch_status = ?2, fetched_at = ?3 WHERE id = ?1`)
+      .bind(id, extracted.fetch_status, ts).run();
+    const failed = await env.DB.prepare(
+      `SELECT ${LIST_COLUMNS}, body_text FROM article WHERE id = ?1`
+    ).bind(id).first();
+    return json({ article: shape(failed), fetchError: extracted.error });
+  }
+
+  const rawKey = await captureRaw(env, extracted.html);
+  const updated = await env.DB.prepare(
+    `UPDATE article SET
+       title = ?2, source = ?3, author = COALESCE(?4, author), published_at = COALESCE(?5, published_at),
+       body_text = ?6, summary = ?7, word_count = ?8,
+       raw_html_key = COALESCE(?9, raw_html_key),
+       fetch_status = 'ok', fetched_at = ?10
+     WHERE id = ?1 AND topic_id = ?11
+     RETURNING ${LIST_COLUMNS}, body_text`
+  ).bind(
+    id,
+    extracted.title || row.title,
+    extracted.source || row.source,
+    extracted.author,
+    extracted.published_at,
+    extracted.body_text,
+    extracted.summary,
+    extracted.word_count,
+    rawKey,
+    ts,
+    TOPIC_ID
+  ).first();
+
+  return json({ article: shape(updated), fetchError: null });
 }
 
 async function getArticle(env, id) {
@@ -429,7 +507,7 @@ export default {
       if (path === '/api/settings') return await settings(env, request);
       if (path === '/api/export' && request.method === 'GET') return await exportAll(env);
 
-      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star))?$/);
+      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch))?$/);
       if (match) {
         const id = Number(match[1]);
         const action = match[2];
@@ -439,6 +517,7 @@ export default {
         if (action === 'listen' && request.method === 'POST') return await markTimestamp(env, id, 'listened_at', 'listened');
         if (action === 'resolve' && request.method === 'POST') return await resolveArticle(env, id, request);
         if (action === 'star' && request.method === 'POST') return await setStar(env, id, request);
+        if (action === 'refetch' && request.method === 'POST') return await refetchArticle(env, id);
         return fail(405, 'Method not allowed.');
       }
 
