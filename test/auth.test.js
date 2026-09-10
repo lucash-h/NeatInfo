@@ -1,12 +1,13 @@
 // One passphrase, one signed cookie. The regression that matters here is G1:
 // the session cookie was only found in first position, so any cookie set ahead
 // of it (Cloudflare's own `__cf_bm`, for one) logged you out.
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
 import { isAuthed } from '../worker/auth.js';
-import { applySchema, call, callJson, sessionCookie } from './helpers.js';
+import { applySchema, resetDb, call, callJson, sessionCookie } from './helpers.js';
 
 beforeAll(applySchema);
+beforeEach(resetDb);
 
 const encoder = new TextEncoder();
 

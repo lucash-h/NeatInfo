@@ -50,6 +50,20 @@ export async function applySchema() {
   }
 }
 
+// The pool no longer rolls storage back between tests, so every stateful test
+// file starts from an empty archive by hand. Deleting through `article` fires
+// the FTS delete trigger, which keeps the index in step with the table.
+export async function resetDb() {
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM event`),
+    env.DB.prepare(`DELETE FROM article_tag`),
+    env.DB.prepare(`DELETE FROM article`),
+    env.DB.prepare(`DELETE FROM tag`),
+    env.DB.prepare(`DELETE FROM setting`),
+    env.DB.prepare(`INSERT INTO setting (key, value) VALUES ('lapse_window_days', '14')`)
+  ]);
+}
+
 export function isoDaysAgo(days) {
   return new Date(Date.now() - days * DAY_MS).toISOString();
 }

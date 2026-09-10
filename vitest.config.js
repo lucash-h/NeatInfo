@@ -7,9 +7,9 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      // Each test file gets its own storage, and every test's writes are
-      // rolled back after it -- schema goes in beforeAll, fixtures per test.
-      isolatedStorage: true,
+      // vitest-pool-workers 0.22 dropped the per-test `isolatedStorage`
+      // rollback, so tests share one D1 file. `resetDb()` in test/helpers.js
+      // is what makes each test independent -- call it in beforeEach.
       singleWorker: true,
       wrangler: { configPath: './wrangler.toml' },
       miniflare: {

@@ -1,8 +1,9 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
-import { applySchema, seedArticle } from './helpers.js';
+import { applySchema, resetDb, seedArticle } from './helpers.js';
 
 beforeAll(applySchema);
+beforeEach(resetDb);
 
 describe('harness', () => {
   it('applies schema.sql to a real local D1', async () => {

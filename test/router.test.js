@@ -1,9 +1,10 @@
 // Success criterion 5: no well-formed request to any route reaches the
 // catch-all 500. The router is small enough to enumerate exhaustively.
-import { beforeAll, describe, expect, it } from 'vitest';
-import { applySchema, call, callJson, seedArticle } from './helpers.js';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { applySchema, resetDb, call, callJson, seedArticle } from './helpers.js';
 
 beforeAll(applySchema);
+beforeEach(resetDb);
 
 const ALLOWED = [200, 201, 400, 401, 404, 405, 409];
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
