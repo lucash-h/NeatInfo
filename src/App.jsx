@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { api } from './api';
+import { api, onUnauthorized } from './api';
 import { AppProvider, useApp } from './AppContext';
 import Gate from './components/Gate';
 import Today from './components/Today';
@@ -15,6 +15,7 @@ function Shell() {
   const [addOpen, setAddOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  // `load` swallows its own failures into a toast, so this cannot reject.
   useEffect(() => { load(); }, []);
 
   // Share-target: /?url=…
@@ -146,6 +147,11 @@ function Shell() {
 
 export default function App() {
   const [authed, setAuthed] = useState(null);
+
+  // A session cookie expires at 90 days, so a 401 will happen in normal use.
+  // api.js reports it here, from wherever it occurred, and the Gate takes over
+  // instead of the screen going blank. §9.1
+  useEffect(() => onUnauthorized(() => setAuthed(false)), []);
 
   useEffect(() => {
     api('/api/session').then(d => setAuthed(d.authed)).catch(() => setAuthed(false));

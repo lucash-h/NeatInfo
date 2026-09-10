@@ -10,17 +10,23 @@ export default function SettingsSheet({ visible, onClose }) {
 
   async function handleSubmit(e) {
     e.preventDefault();
-    await api('/api/settings', {
-      method: 'PUT',
-      body: JSON.stringify({ lapseWindowDays: Number(value) }),
-    });
+    try {
+      await api('/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ lapseWindowDays: Number(value) }),
+      });
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
     onClose();
     toast('Saved');
     await load();
   }
 
   async function signOut() {
-    await api('/api/session', { method: 'DELETE' });
+    // A failed sign-out still means signing out locally.
+    await api('/api/session', { method: 'DELETE' }).catch(() => {});
     location.reload();
   }
 

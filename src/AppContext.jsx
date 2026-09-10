@@ -1,5 +1,5 @@
-import { createContext, useContext, useState, useCallback, useRef } from 'react';
-import { api, localDayStart } from './api';
+import { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
+import { api, localDayStart, ApiError } from './api';
 
 const AppContext = createContext();
 
@@ -27,7 +27,33 @@ export function AppProvider({ children }) {
     toastTimer.current = setTimeout(() => setToastMsg(null), 2600);
   }, []);
 
-  const load = useCallback(async (opts = {}) => {
+  // Every action below goes through this. A 401 is already being handled by
+  // the Gate (api.js calls the unauthorized handler), so it is swallowed here
+  // rather than toasted on the way out; anything else becomes a toast and the
+  // caller gets `undefined` instead of an unhandled rejection. §9.1
+  const guard = useCallback(async (work, fallback) => {
+    try {
+      return await work();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) return undefined;
+      toast(err?.message || fallback || 'Something went wrong.');
+      return undefined;
+    }
+  }, [toast]);
+
+  // The last net: a rejection that escapes anyway is reported rather than
+  // logged silently to a console nobody has open.
+  useEffect(() => {
+    function onRejection(event) {
+      const err = event.reason;
+      if (err instanceof ApiError && err.status === 401) return;
+      toast(err?.message || 'Something went wrong.');
+    }
+    window.addEventListener('unhandledrejection', onRejection);
+    return () => window.removeEventListener('unhandledrejection', onRejection);
+  }, [toast]);
+
+  const load = useCallback((opts = {}) => guard(async () => {
     const searchQuery = opts.query ?? query;
     const searchFilter = opts.filter ?? filter;
     const params = new URLSearchParams({
@@ -38,7 +64,7 @@ export function AppProvider({ children }) {
     const data = await api(`/api/feed?${params}`);
     setFeed(data);
     return data;
-  }, [query, filter]);
+  }, 'Could not load the feed.'), [query, filter, guard]);
 
   const switchSurface = useCallback((name) => {
     setSurface(name);
@@ -46,15 +72,18 @@ export function AppProvider({ children }) {
     setOpenArticle(null);
   }, []);
 
-  const open = useCallback(async (id) => {
+  const open = useCallback((id) => guard(async () => {
     const { article } = await api(`/api/articles/${id}`);
     setOpenArticle(article);
     if (!article.opened_at) {
+      // Fire-and-forget, but never unhandled: failing to record opened_at is
+      // not worth a toast.
       api(`/api/articles/${id}/open`, { method: 'POST' }).catch(() => {});
     }
-  }, []);
+    return article;
+  }, 'Could not open that one.'), [guard]);
 
-  const resolve = useCallback(async (id, status, favorite) => {
+  const resolve = useCallback((id, status, favorite) => guard(async () => {
     await api(`/api/articles/${id}/resolve`, {
       method: 'POST',
       body: JSON.stringify({ status, favorite }),
@@ -62,26 +91,27 @@ export function AppProvider({ children }) {
     toast(favorite ? 'Starred and archived' : status === 'kept' ? 'Kept' : 'Dismissed');
     setOpenArticle(null);
     await load();
-  }, [load, toast]);
+  }, 'Could not save that decision.'), [load, toast, guard]);
 
-  const toggleStar = useCallback(async (id, favorite) => {
+  const toggleStar = useCallback((id, favorite) => guard(async () => {
     await api(`/api/articles/${id}/star`, {
       method: 'POST',
       body: JSON.stringify({ favorite }),
     });
     const data = await load();
+    if (!data) return;
     const all = [...data.today, ...data.pending, ...data.archive];
     const updated = all.find(a => a.id === id);
     if (updated) setOpenArticle(updated);
-  }, [load]);
+  }, 'Could not change the star.'), [load, guard]);
 
-  const saveNote = useCallback(async (id, notes) => {
+  const saveNote = useCallback((id, notes) => guard(async () => {
     await api(`/api/articles/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({ notes }),
     });
     toast('Note saved');
-  }, [toast]);
+  }, 'Could not save the note.'), [toast, guard]);
 
   const close = useCallback(() => {
     setOpenArticle(null);
