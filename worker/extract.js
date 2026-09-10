@@ -138,6 +138,42 @@ export async function extractArticle(url) {
   };
 }
 
+// D1 refuses any single value over roughly 1 MB with
+// `D1_ERROR: string or blob too big: SQLITE_TOOBIG`, so a long page used to
+// 500 at INSERT and the article was lost outright -- exactly the dead end §3
+// "Pull" forbids. The cap is half that ceiling: ~85,000 words, some seventeen
+// times the 5,000-word article §5.1 sizes the archive around, with enough
+// headroom that multibyte text and the marker below cannot push a value over
+// the limit. Nothing is truly lost -- the raw HTML is already in R2. §5.2
+export const BODY_TEXT_LIMIT = 512 * 1024;
+
+export const TRUNCATION_MARK =
+  '\n\n[NeatInfo kept the first 512 KB of this page. The full copy is in R2. §5.2]';
+
+// Returns the text to store and whether it had to be cut, so the caller can
+// say so rather than silently keeping half an article.
+export function truncateBodyText(text, limit = BODY_TEXT_LIMIT) {
+  if (!text) return { text: text ?? null, truncated: false };
+
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(text);
+  if (bytes.byteLength <= limit) return { text, truncated: false };
+
+  const room = limit - encoder.encode(TRUNCATION_MARK).byteLength;
+  // A byte slice can land inside a multi-byte character; the decoder turns the
+  // stub into U+FFFD, which is then trimmed off.
+  let cut = new TextDecoder().decode(bytes.subarray(0, room)).replace(/\uFFFD+$/, '');
+
+  // Prefer a paragraph break, then a word break, so the text does not stop
+  // mid-word. Both are only accepted near the end of what was kept.
+  const floor = Math.floor(cut.length * 0.9);
+  const paragraph = cut.lastIndexOf('\n\n');
+  const word = cut.lastIndexOf(' ');
+  const at = paragraph > floor ? paragraph : word > floor ? word : cut.length;
+
+  return { text: cut.slice(0, at).trimEnd() + TRUNCATION_MARK, truncated: true };
+}
+
 export function summarizeText(text) {
   const trimmed = text.trim();
   const firstBreak = trimmed.indexOf('\n');

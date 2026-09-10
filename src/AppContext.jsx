@@ -117,12 +117,14 @@ export function AppProvider({ children }) {
 
   // §3 "Pull": completing a failed fetch by hand, in place.
   const fillArticle = useCallback((id, fields) => guard(async () => {
-    const { article } = await api(`/api/articles/${id}`, {
+    const { article, bodyTruncated } = await api(`/api/articles/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(fields),
     });
     setOpenArticle(article);
-    toast('Filled in');
+    // D1 will not hold more than ~1 MB in a value, so a very long paste is cut
+    // at 512 KB rather than lost. Say so instead of silently keeping half. §5.2
+    toast(bodyTruncated ? 'Saved — only the first 512 KB of that text was kept' : 'Filled in');
     await load();
     return article;
   }, 'Could not save that text.'), [guard, load, toast]);

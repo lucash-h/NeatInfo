@@ -69,6 +69,10 @@ export default function AddSheet({ visible, onClose }) {
         return;
       }
 
+      if (result.bodyTruncated) {
+        toast('Added — the text was long, so only the first 512 KB was kept');
+      }
+
       if (result.fetchError) {
         toast('Added — but the page could not be read');
         setNotice(`${result.fetchError}. The item is saved with its URL; paste the text to fill it in.`);

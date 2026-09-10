@@ -1,5 +1,5 @@
 import { isAuthed, issueCookie, clearCookie, checkPassphrase } from './auth.js';
-import { extractArticle, summarizeText, countWords } from './extract.js';
+import { extractArticle, summarizeText, countWords, truncateBodyText } from './extract.js';
 import { normalizeUrl, sourceFromUrl } from './url.js';
 import { ftsQuery, buildArchiveQuery } from './search.js';
 
@@ -224,6 +224,13 @@ async function addArticle(env, request) {
   if (!record.source) record.source = normalized ? sourceFromUrl(normalized) : 'pasted';
   if (!record.summary) record.summary = pastedText ? summarizeText(pastedText) : '';
 
+  // D1 rejects a value over ~1 MB outright, which would lose the article at
+  // the INSERT. Cut the text instead, and recount the words so the estimated
+  // read time describes what is actually here. §3 "Pull" / §5.2
+  const capped = truncateBodyText(record.body_text);
+  record.body_text = capped.text;
+  if (capped.truncated) record.word_count = countWords(capped.text);
+
   const ts = nowIso();
   const inserted = await env.DB.prepare(
     `INSERT INTO article
@@ -240,7 +247,10 @@ async function addArticle(env, request) {
   await env.DB.prepare(`INSERT INTO event (article_id, type, created_at) VALUES (?1, 'added', ?2)`)
     .bind(inserted.id, ts).run();
 
-  return json({ article: shape(inserted), fetchError }, { status: 201 });
+  return json(
+    { article: shape(inserted), fetchError, bodyTruncated: capped.truncated },
+    { status: 201 }
+  );
 }
 
 // ------------------------------------------------------------- transitions
@@ -327,8 +337,12 @@ async function updateArticle(env, id, request) {
     sets.push('source = ?');
     binds.push(body.source.trim().slice(0, 200));
   }
+  let bodyTruncated = false;
   if (typeof body.body_text === 'string' && body.body_text.trim()) {
-    const text = body.body_text.trim();
+    // Same cap as ingest: a paste out of a very long page must not 500. §5.2
+    const capped = truncateBodyText(body.body_text.trim());
+    const text = capped.text;
+    bodyTruncated = capped.truncated;
     sets.push('body_text = ?', 'word_count = ?', "fetch_status = 'pasted'", 'fetched_at = ?');
     binds.push(text, countWords(text), nowIso());
     // A summary already on the card is not replaced behind the reader's back;
@@ -366,7 +380,7 @@ async function updateArticle(env, id, request) {
   if (!row) return fail(404, 'No such article.');
 
   const [withTag] = await withTags(env, [row]);
-  return json({ article: shape(withTag) });
+  return json({ article: shape(withTag), bodyTruncated });
 }
 
 // The other half of "never a dead end": a fetch that failed for a transient
@@ -392,6 +406,7 @@ async function refetchArticle(env, id) {
   }
 
   const rawKey = await captureRaw(env, extracted.html);
+  const capped = truncateBodyText(extracted.body_text);
   const updated = await env.DB.prepare(
     `UPDATE article SET
        title = ?2, source = ?3, author = COALESCE(?4, author), published_at = COALESCE(?5, published_at),
@@ -406,15 +421,15 @@ async function refetchArticle(env, id) {
     extracted.source || row.source,
     extracted.author,
     extracted.published_at,
-    extracted.body_text,
+    capped.text,
     extracted.summary,
-    extracted.word_count,
+    capped.truncated ? countWords(capped.text) : extracted.word_count,
     rawKey,
     ts,
     TOPIC_ID
   ).first();
 
-  return json({ article: shape(updated), fetchError: null });
+  return json({ article: shape(updated), fetchError: null, bodyTruncated: capped.truncated });
 }
 
 async function getArticle(env, id) {
