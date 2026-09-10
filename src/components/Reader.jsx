@@ -1,20 +1,40 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useApp } from '../AppContext';
 import { metaLine } from '../helpers';
 import TtsPlayer from './TtsPlayer';
-import { api } from '../api';
 
 export default function Reader() {
   const { openArticle: a, close, resolve, toggleStar, saveNote } = useApp();
   const noteTimer = useRef();
-  const [noteValue, setNoteValue] = useState('');
+  const pendingNote = useRef(null);
+  const saveNoteRef = useRef(saveNote);
+  saveNoteRef.current = saveNote;
+  const [noteValue, setNoteValue] = useState(a?.notes || '');
+
+  // G8: the note used to be an uncontrolled `defaultValue`, so stepping j/l
+  // left the previous article's note on screen. It is keyed to the article
+  // now, and a debounced edit is flushed before the article changes under it.
+  useEffect(() => {
+    setNoteValue(a?.notes || '');
+    return () => {
+      clearTimeout(noteTimer.current);
+      const queued = pendingNote.current;
+      pendingNote.current = null;
+      if (queued) saveNoteRef.current(queued.id, queued.value);
+    };
+  }, [a?.id]);
 
   const handleNoteChange = useCallback((e) => {
     const val = e.target.value;
+    const id = a.id;
     setNoteValue(val);
+    pendingNote.current = { id, value: val };
     clearTimeout(noteTimer.current);
-    noteTimer.current = setTimeout(() => saveNote(a.id, val), 800);
-  }, [a, saveNote]);
+    noteTimer.current = setTimeout(() => {
+      pendingNote.current = null;
+      saveNoteRef.current(id, val);
+    }, 800);
+  }, [a]);
 
   if (!a) {
     return (
@@ -86,9 +106,10 @@ export default function Reader() {
           <div className="note-block">
             <span className="eyebrow">Note</span>
             <textarea
+              key={a.id}
               className="input textarea"
               placeholder="Why this mattered — searchable later"
-              defaultValue={a.notes || ''}
+              value={noteValue}
               onChange={handleNoteChange}
             />
           </div>

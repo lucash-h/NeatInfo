@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
 import { api, localDayStart, ApiError } from './api';
+import { getPlayer } from './tts';
 
 const AppContext = createContext();
 
@@ -67,6 +68,7 @@ export function AppProvider({ children }) {
   }, 'Could not load the feed.'), [query, filter, guard]);
 
   const switchSurface = useCallback((name) => {
+    getPlayer().stop();
     setSurface(name);
     setQuery('');
     setOpenArticle(null);
@@ -114,6 +116,9 @@ export function AppProvider({ children }) {
   }, 'Could not save the note.'), [toast, guard]);
 
   const close = useCallback(() => {
+    // Closing the reader must silence it, however it was closed -- the Back
+    // button, Escape, or switching surface. §6
+    getPlayer().stop();
     setOpenArticle(null);
   }, []);
 
