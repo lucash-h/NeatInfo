@@ -51,20 +51,30 @@ function shape(row) {
   return { ...row, favorite: Boolean(row.favorite) };
 }
 
+// D1 refuses a statement with more than 100 bound variables, so a full page of
+// archive rows cannot be looked up in one `IN (...)`. Found by the 250-row
+// paging test: a 200-row page came back as a 500. §3 "Store"
+const BIND_CHUNK = 90;
+
 async function withTags(env, rows) {
   if (!rows.length) return rows;
   const ids = rows.map((r) => r.id);
-  const { results } = await env.DB.prepare(
-    `SELECT at.article_id, t.name FROM article_tag at
-     JOIN tag t ON t.id = at.tag_id
-     WHERE at.article_id IN (${ids.map(() => '?').join(',')})`
-  ).bind(...ids).all();
 
   const byArticle = new Map();
-  for (const r of results) {
-    if (!byArticle.has(r.article_id)) byArticle.set(r.article_id, []);
-    byArticle.get(r.article_id).push(r.name);
+  for (let i = 0; i < ids.length; i += BIND_CHUNK) {
+    const chunk = ids.slice(i, i + BIND_CHUNK);
+    const { results } = await env.DB.prepare(
+      `SELECT at.article_id, t.name FROM article_tag at
+       JOIN tag t ON t.id = at.tag_id
+       WHERE at.article_id IN (${chunk.map(() => '?').join(',')})`
+    ).bind(...chunk).all();
+
+    for (const r of results) {
+      if (!byArticle.has(r.article_id)) byArticle.set(r.article_id, []);
+      byArticle.get(r.article_id).push(r.name);
+    }
   }
+
   return rows.map((r) => ({ ...r, tags: byArticle.get(r.id) || [] }));
 }
 

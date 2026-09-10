@@ -52,6 +52,10 @@ CREATE INDEX IF NOT EXISTS article_resolved ON article(topic_id, status, resolve
 -- the GROUP BY behind /api/facets have an index to walk. §3 "Store"
 CREATE INDEX IF NOT EXISTS article_source ON article(topic_id, source);
 
+-- The date-range filter is on added_at across every status, which the
+-- status-prefixed indexes above cannot serve.
+CREATE INDEX IF NOT EXISTS article_added ON article(topic_id, added_at);
+
 -- Starred is a surface of its own and is a favorite=1 filter server-side, so
 -- the index is partial: it holds only the rows that surface can show.
 CREATE INDEX IF NOT EXISTS article_favorite ON article(topic_id, resolved_at) WHERE favorite = 1;

@@ -295,3 +295,124 @@ describe('GET /api/facets', () => {
     expect(res.headers.get('content-type')).toContain('application/json');
   });
 });
+
+// Success criterion 8: the archive was capped at a hardcoded LIMIT 200 with no
+// paging and an unfiltered total, so "searchable forever" (§2.2) stopped being
+// true at row 201 and the number on screen described a page rather than an
+// archive.
+describe('paging past the old 200-row cap', () => {
+  const BULK = 250;
+
+  // Distinct resolved_at values, newest first, so the order the archive pages
+  // in is deterministic rather than an artefact of insertion order.
+  async function seedBulk() {
+    const statements = [];
+    for (let i = 0; i < BULK; i++) {
+      const at = new Date(Date.UTC(2026, 0, 1) + i * 3600000).toISOString();
+      statements.push(
+        env.DB.prepare(
+          `INSERT INTO article (topic_id, title, source, status, favorite, added_at, resolved_at, body_text)
+           VALUES (1, ?1, ?2, 'kept', ?3, ?4, ?4, ?5)`
+        ).bind(
+          `Bulk row ${i}`,
+          i % 5 === 0 ? 'special.example' : 'bulk.example',
+          i % 10 === 0 ? 1 : 0,
+          at,
+          `Body of bulk row ${i}.` + (i % 10 === 0 ? ' A kangaroo appears.' : '')
+        )
+      );
+    }
+    await env.DB.batch(statements);
+  }
+
+  it('returns the right slice on each page and a total of 250', async () => {
+    await seedBulk();
+
+    const first = await feed('&limit=50');
+    expect(first.body.archive).toHaveLength(50);
+    expect(first.body.archiveTotal).toBe(BULK);
+    // Newest first: row 249 down to row 200.
+    expect(first.body.archive[0].title).toBe('Bulk row 249');
+    expect(first.body.archive[49].title).toBe('Bulk row 200');
+
+    const second = await feed('&limit=50&offset=50');
+    expect(second.body.archive).toHaveLength(50);
+    expect(second.body.archiveTotal).toBe(BULK);
+    expect(second.body.archive[0].title).toBe('Bulk row 199');
+    expect(second.body.archive[49].title).toBe('Bulk row 150');
+
+    // No row appears on two pages.
+    const ids = new Set([
+      ...first.body.archive.map((a) => a.id),
+      ...second.body.archive.map((a) => a.id)
+    ]);
+    expect(ids.size).toBe(100);
+  });
+
+  it('reaches the rows past 200, which is what the cap used to hide', async () => {
+    await seedBulk();
+    const tail = await feed('&limit=50&offset=200');
+    expect(tail.body.archive).toHaveLength(50);
+    expect(tail.body.archive[0].title).toBe('Bulk row 49');
+    expect(tail.body.archive[49].title).toBe('Bulk row 0');
+  });
+
+  it('walks the whole archive page by page, once each', async () => {
+    await seedBulk();
+    const seen = [];
+    for (let offset = 0; offset < BULK; offset += 100) {
+      const page = await feed(`&limit=100&offset=${offset}`);
+      seen.push(...page.body.archive.map((a) => a.id));
+    }
+    expect(seen).toHaveLength(BULK);
+    expect(new Set(seen).size).toBe(BULK);
+  });
+
+  it('an offset past the end is an empty page, not an error, and the total holds', async () => {
+    await seedBulk();
+    const { status, body } = await feed('&limit=50&offset=1000');
+    expect(status).toBe(200);
+    expect(body.archive).toEqual([]);
+    expect(body.archiveTotal).toBe(BULK);
+  });
+
+  it('reports the filtered total beside a filtered page, not the whole archive', async () => {
+    await seedBulk();
+    const { body } = await feed('&limit=10&source=' + encodeURIComponent('special.example'));
+    expect(body.archive).toHaveLength(10);
+    // Every fifth row: 250 / 5.
+    expect(body.archiveTotal).toBe(50);
+    expect(body.archive.every((a) => a.source === 'special.example')).toBe(true);
+  });
+
+  it('searches the whole archive, not the first page of it', async () => {
+    await seedBulk();
+    // "kangaroo" is only on every tenth row, none of them on page one by
+    // recency alone -- a client-side search over a page would miss most.
+    const { body } = await feed('&limit=5&q=kangaroo');
+    expect(body.archiveTotal).toBe(25);
+    expect(body.archive).toHaveLength(5);
+  });
+
+  it('still attaches tags on a page wider than the D1 bound-variable limit', async () => {
+    await seedBulk();
+    // The tag lookup used to be one `IN (?, ...)` over the whole page, which
+    // D1 rejects past 100 variables -- a 200-row page 500d.
+    const { body: firstPage } = await feed('&limit=200');
+    await tagArticle(firstPage.archive[150].id, ['deep']);
+
+    const { status, body } = await feed('&limit=200');
+    expect(status).toBe(200);
+    expect(body.archive).toHaveLength(MAX_LIMIT);
+    expect(body.archive[150].tags).toEqual(['deep']);
+    expect(body.archive.every((a) => Array.isArray(a.tags))).toBe(true);
+  });
+
+  it('never hands back more than the maximum page, however large the ask', async () => {
+    await seedBulk();
+    const { status, body } = await feed('&limit=100000');
+    expect(status, JSON.stringify(body)).toBe(200);
+    expect(body.archive).toHaveLength(MAX_LIMIT);
+    expect(body.archiveTotal).toBe(BULK);
+  });
+});
