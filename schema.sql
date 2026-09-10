@@ -48,6 +48,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS article_url_unique
 CREATE INDEX IF NOT EXISTS article_surface ON article(topic_id, status, added_at);
 CREATE INDEX IF NOT EXISTS article_resolved ON article(topic_id, status, resolved_at);
 
+-- The archive filter bar filters and facets by source, so both the WHERE and
+-- the GROUP BY behind /api/facets have an index to walk. §3 "Store"
+CREATE INDEX IF NOT EXISTS article_source ON article(topic_id, source);
+
+-- Starred is a surface of its own and is a favorite=1 filter server-side, so
+-- the index is partial: it holds only the rows that surface can show.
+CREATE INDEX IF NOT EXISTS article_favorite ON article(topic_id, resolved_at) WHERE favorite = 1;
+
 CREATE TABLE IF NOT EXISTS tag (
   id   INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE

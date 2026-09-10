@@ -3,7 +3,7 @@
 // back as a 500, which is the single most likely way normal use looks broken.
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { applySchema, callJson, resetDb, seedArticle } from './helpers.js';
-import { ftsQuery, buildArchiveQuery } from '../worker/search.js';
+import { ftsQuery, buildArchiveQuery, DEFAULT_LIMIT } from '../worker/search.js';
 
 beforeAll(applySchema);
 beforeEach(resetDb);
@@ -192,6 +192,6 @@ describe('buildArchiveQuery', () => {
     const { sql, binds } = buildArchiveQuery({ columns: 'id', topicId: 1 });
     expect(sql).not.toContain('article_fts');
     expect(sql).toContain('ORDER BY COALESCE(a.resolved_at, a.added_at) DESC');
-    expect(binds).toEqual([1, 200, 0]);
+    expect(binds).toEqual([1, DEFAULT_LIMIT, 0]);
   });
 });

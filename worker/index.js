@@ -1,7 +1,7 @@
 import { isAuthed, issueCookie, clearCookie, checkPassphrase } from './auth.js';
 import { extractArticle, summarizeText, countWords, truncateBodyText } from './extract.js';
 import { normalizeUrl, sourceFromUrl } from './url.js';
-import { ftsQuery, buildArchiveQuery } from './search.js';
+import { ftsQuery, buildArchiveQuery, buildArchiveCount, parseArchiveParams } from './search.js';
 
 const TOPIC_ID = 1;
 
@@ -77,6 +77,12 @@ async function getFeed(env, url) {
   const filter = url.searchParams.get('filter') || 'all';
   const query = (url.searchParams.get('q') || '').trim();
 
+  // §3 "Store" filters plus the page window. A filter the server cannot
+  // honour is a 400, not a silently unfiltered archive.
+  const params = parseArchiveParams(url.searchParams);
+  if (params.error) return fail(400, params.error);
+  const { filters, limit, offset } = params;
+
   const days = await lapseWindow(env);
   await applyLapses(env, days);
 
@@ -94,13 +100,22 @@ async function getFeed(env, url) {
 
   // A search whose every character is punctuation matches nothing searchable,
   // so it falls back to the unfiltered archive instead of erroring. §3 "Store"
-  const { sql, binds } = buildArchiveQuery({
+  const match = ftsQuery(query);
+  const archiveQuery = buildArchiveQuery({
     columns: LIST_COLUMNS,
     topicId: TOPIC_ID,
-    match: ftsQuery(query),
-    limit: 200
+    match,
+    filters,
+    limit,
+    offset
   });
-  const archive = await env.DB.prepare(sql).bind(...binds).all();
+  const archive = await env.DB.prepare(archiveQuery.sql).bind(...archiveQuery.binds).all();
+
+  // The total is counted under the same predicate as the rows, so the archive
+  // can report "N of M" honestly past the end of the first page rather than
+  // describing one page of 200 as the whole archive. §2.2, §3 "Store"
+  const countQuery = buildArchiveCount({ topicId: TOPIC_ID, match, filters });
+  const archivedTotal = await env.DB.prepare(countQuery.sql).bind(...countQuery.binds).first();
 
   // "Opened but undecided" is a filter on Pending, not a fourth surface. §2.3
   const pendingRows = pending.results.filter((r) => {
@@ -109,17 +124,16 @@ async function getFeed(env, url) {
     return true;
   });
 
-  const archivedTotal = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM article WHERE topic_id = ?1 AND status != 'new'`
-  ).bind(TOPIC_ID).first();
-
   return json({
     lapseWindowDays: days,
     today: (await withTags(env, today.results)).map(shape),
     pending: (await withTags(env, pendingRows)).map(shape),
     pendingTotal: pending.results.length,
     archive: (await withTags(env, archive.results)).map(shape),
-    archiveTotal: archivedTotal?.n ?? 0
+    archiveTotal: archivedTotal?.n ?? 0,
+    archiveLimit: limit,
+    archiveOffset: offset,
+    archiveFilters: filters
   });
 }
 
