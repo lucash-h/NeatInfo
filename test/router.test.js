@@ -24,10 +24,12 @@ describe('router', () => {
       `/api/articles/${id}/resolve`,
       `/api/articles/${id}/star`,
       `/api/articles/${id}/refetch`,
+      `/api/articles/${id}/raw`,
       '/api/articles/999999',
       '/api/articles/999999/open',
       '/api/articles/999999/resolve',
       '/api/articles/999999/refetch',
+      '/api/articles/999999/raw',
       '/api/articles/not-a-number',
       `/api/articles/${id}/bogus-action`,
       '/api/settings',
@@ -63,7 +65,7 @@ describe('router', () => {
     expect(body.error).toBe('Method not allowed.');
   });
 
-  it('404s an action that is not one of open/listen/resolve/star/refetch', async () => {
+  it('404s an action that is not one of open/listen/resolve/star/refetch/raw', async () => {
     const { id } = await seedArticle();
     expect((await call(`/api/articles/${id}/publish`, { method: 'POST', body: '{}' })).status).toBe(404);
   });

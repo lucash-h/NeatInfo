@@ -551,6 +551,37 @@ async function refetchArticle(env, id) {
   return json({ article: shape(updated), fetchError: null, bodyTruncated: capped.truncated });
 }
 
+// §5.4 asks for a ten-minute check that the raw capture has the *shape* v2
+// needs -- outbound links, numeric density, chunkable text. That check cannot
+// be run at all while the only copy of the raw HTML is an R2 key nothing
+// serves, so this streams the object straight through rather than buffering a
+// 2 MB page into memory to hand it back. §5.2 / §5.4
+async function getRawHtml(env, id) {
+  const row = await env.DB.prepare(
+    `SELECT raw_html_key FROM article WHERE id = ?1 AND topic_id = ?2`
+  ).bind(id, TOPIC_ID).first();
+
+  if (!row) return fail(404, 'No such article.');
+  // A pasted item, a failed fetch, a page over the per-object cap: all of them
+  // are articles with no raw copy, which is a 404 for this resource rather
+  // than an error about the article.
+  if (!row.raw_html_key) return fail(404, 'No raw copy was kept for that one.');
+  if (!env.RAW) return fail(404, 'Raw capture is not configured.');
+
+  const object = await env.RAW.get(row.raw_html_key).catch(() => null);
+  if (!object) return fail(404, 'The raw copy is no longer in R2.');
+
+  return new Response(object.body, {
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': String(object.size),
+      etag: object.httpEtag,
+      // Raw HTML is a snapshot: once written it never changes.
+      'cache-control': 'private, max-age=31536000, immutable'
+    }
+  });
+}
+
 async function getArticle(env, id) {
   const row = await env.DB.prepare(
     `SELECT ${LIST_COLUMNS}, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
@@ -647,7 +678,7 @@ export default {
       if (path === '/api/settings') return await settings(env, request);
       if (path === '/api/export' && request.method === 'GET') return await exportAll(env);
 
-      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch))?$/);
+      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch|raw))?$/);
       if (match) {
         const id = Number(match[1]);
         const action = match[2];
@@ -658,6 +689,7 @@ export default {
         if (action === 'resolve' && request.method === 'POST') return await resolveArticle(env, id, request);
         if (action === 'star' && request.method === 'POST') return await setStar(env, id, request);
         if (action === 'refetch' && request.method === 'POST') return await refetchArticle(env, id);
+        if (action === 'raw' && request.method === 'GET') return await getRawHtml(env, id);
         return fail(405, 'Method not allowed.');
       }
 
