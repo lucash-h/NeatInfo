@@ -1,6 +1,8 @@
 // Article extraction on Workers. HTMLRewriter is the native streaming parser here;
 // Node readability libraries do not run on this runtime. §7.6
 
+import { isArxivAbs } from './url.js';
+
 const SKIP = new Set(['script', 'style', 'noscript', 'nav', 'header', 'footer', 'aside', 'form', 'svg']);
 const BLOCKS = 'article p, article li, main p, main li, [role="main"] p, [role="main"] li, body p, body li';
 
@@ -80,6 +82,104 @@ function firstWords(text, n) {
   return words.join(' ') + (text.split(/\s+/).length > n ? '…' : '');
 }
 
+// ------------------------------------------------------------------ arXiv
+//
+// §9.5: papers are not an edge case here, and the generic extractor refuses a
+// PDF rather than mangling it. The narrow slice: the /abs/ page carries the
+// title, the authors, the date and the whole abstract as ordinary HTML, and
+// worker/url.js already points both link shapes at it. The abstract becomes
+// the body text -- it is what the paper claims, which is what triage needs.
+// Full PDF text extraction stays out of v1 (decision D1); AddSheet's
+// paste-the-text fallback is still there for when the abstract is not enough.
+
+class ArxivMeta {
+  constructor() {
+    this.title = '';
+    this.authors = [];
+    this.date = null;
+    this.abstract = '';
+  }
+  element(el) {
+    const name = (el.getAttribute('name') || '').toLowerCase();
+    const content = el.getAttribute('content');
+    if (!content) return;
+    if (name === 'citation_title' && !this.title) this.title = content.trim();
+    else if (name === 'citation_author') this.authors.push(content.trim());
+    else if ((name === 'citation_date' || name === 'citation_online_date') && !this.date) this.date = content.trim();
+    else if (name === 'citation_abstract' && !this.abstract) this.abstract = content.trim();
+  }
+}
+
+class Collect {
+  constructor() {
+    this.buf = '';
+  }
+  text(chunk) {
+    this.buf += chunk.text;
+  }
+  get value() {
+    return this.buf.replace(/\s+/g, ' ').trim();
+  }
+}
+
+// arXiv prefixes the visible blocks with a descriptor span: "Abstract: ...",
+// "Title:...". Stripping it is cosmetic but it is what ends up in the summary.
+function stripDescriptor(text) {
+  return text.replace(/^(abstract|title|authors|subjects)\s*:\s*/i, '').trim();
+}
+
+// citation_date is `2024/01/16`; the schema stores ISO strings.
+function arxivDate(raw) {
+  if (!raw) return null;
+  const parts = raw.split(/[/-]/).map((p) => p.trim());
+  if (parts.length < 3) return null;
+  const [y, m, d] = parts;
+  if (!/^\d{4}$/.test(y)) return null;
+  return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+}
+
+// Returns the extracted paper, or null when the page did not look like an
+// abstract page after all -- in which case the caller falls back to the
+// generic extractor rather than storing an empty item.
+export async function extractArxiv(html) {
+  const meta = new ArxivMeta();
+  const abstract = new Collect();
+  const title = new Collect();
+  const authors = new Collect();
+
+  await new HTMLRewriter()
+    .on('meta', meta)
+    .on('blockquote.abstract', abstract)
+    .on('h1.title', title)
+    .on('div.authors', authors)
+    .transform(new Response(html))
+    .text();
+
+  const paperTitle = meta.title || stripDescriptor(title.value);
+  const body = meta.abstract || stripDescriptor(abstract.value);
+  if (!paperTitle || !body) return null;
+
+  // The author column is one TEXT field, and a long-collaboration paper can
+  // list hundreds.
+  const names = meta.authors.length
+    ? meta.authors
+    : stripDescriptor(authors.value).split(/,\s*/).filter(Boolean);
+  const author = names.length > 8 ? names.slice(0, 8).join(', ') + ' et al.' : names.join(', ');
+
+  return {
+    ok: true,
+    fetch_status: 'ok',
+    html,
+    title: paperTitle,
+    summary: firstWords(body, 40),
+    source: 'arXiv',
+    author: author || null,
+    published_at: arxivDate(meta.date),
+    body_text: body,
+    word_count: countWords(body)
+  };
+}
+
 export async function extractArticle(url) {
   let res;
   try {
@@ -106,6 +206,13 @@ export async function extractArticle(url) {
   }
 
   const html = await res.text();
+
+  // §9.5's narrow slice. The abstract page is the only non-generic path in
+  // here; everything else, arXiv listing pages included, falls through.
+  if (isArxivAbs(url)) {
+    const paper = await extractArxiv(html);
+    if (paper) return paper;
+  }
 
   const meta = new Meta();
   const body = new Body();
