@@ -1,6 +1,7 @@
 import { isAuthed, issueCookie, clearCookie, checkPassphrase } from './auth.js';
 import { extractArticle, summarizeText, countWords } from './extract.js';
 import { normalizeUrl, sourceFromUrl } from './url.js';
+import { ftsQuery, buildArchiveQuery } from './search.js';
 
 const TOPIC_ID = 1;
 
@@ -91,25 +92,15 @@ async function getFeed(env, url) {
      ORDER BY added_at ASC`
   ).bind(TOPIC_ID, dayStart).all();
 
-  let archive;
-  if (query) {
-    const cols = LIST_COLUMNS.split(',').map((c) => 'a.' + c.trim()).join(', ');
-    archive = await env.DB.prepare(
-      `SELECT ${cols}
-       FROM article_fts f
-       JOIN article a ON a.id = f.rowid
-       WHERE article_fts MATCH ?1 AND a.topic_id = ?2 AND a.status != 'new'
-       ORDER BY rank
-       LIMIT 200`
-    ).bind(query.replace(/["'*]/g, '') + '*', TOPIC_ID).all();
-  } else {
-    archive = await env.DB.prepare(
-      `SELECT ${LIST_COLUMNS} FROM article
-       WHERE topic_id = ?1 AND status != 'new'
-       ORDER BY COALESCE(resolved_at, added_at) DESC
-       LIMIT 200`
-    ).bind(TOPIC_ID).all();
-  }
+  // A search whose every character is punctuation matches nothing searchable,
+  // so it falls back to the unfiltered archive instead of erroring. §3 "Store"
+  const { sql, binds } = buildArchiveQuery({
+    columns: LIST_COLUMNS,
+    topicId: TOPIC_ID,
+    match: ftsQuery(query),
+    limit: 200
+  });
+  const archive = await env.DB.prepare(sql).bind(...binds).all();
 
   // "Opened but undecided" is a filter on Pending, not a fourth surface. §2.3
   const pendingRows = pending.results.filter((r) => {
