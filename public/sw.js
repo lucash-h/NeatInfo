@@ -1,10 +1,20 @@
 // Offline shell only. The API is never cached -- a stale Today page would be
 // worse than no page, and the archive is the thing that must stay truthful.
-const CACHE = 'neatinfo-shell-v1';
-const SHELL = ['/', '/index.html', '/styles.css', '/app.js', '/manifest.webmanifest', '/icon.svg'];
+const CACHE = 'neatinfo-shell-v2';
+
+// Only files that exist unconditionally. The React bundle is content-hashed by
+// Vite, so its name is not knowable here; it is picked up by the runtime
+// stale-while-revalidate below on the first online visit instead.
+const SHELL = ['/', '/manifest.webmanifest', '/icon.svg'];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  event.waitUntil(
+    caches.open(CACHE)
+      // One missing file must not fail the whole install -- that is what the
+      // stale list of the pre-React frontend used to do.
+      .then((c) => Promise.all(SHELL.map((u) => c.add(u).catch(() => {}))))
+      .then(() => self.skipWaiting())
+  );
 });
 
 self.addEventListener('activate', (event) => {
@@ -28,6 +38,8 @@ self.addEventListener('fetch', (event) => {
         caches.open(CACHE).then((c) => c.put(event.request, copy)).catch(() => {});
         return res;
       })
-      .catch(() => caches.match(event.request).then((hit) => hit || caches.match('/index.html')))
+      // `not_found_handling = "single-page-application"` means every route is
+      // served by the shell at '/', so that is the offline fallback.
+      .catch(() => caches.match(event.request).then((hit) => hit || caches.match('/')))
   );
 });
