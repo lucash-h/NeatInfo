@@ -1,6 +1,6 @@
 // Card metadata and the lapse countdown the Pending surface shows. §2.4, §3
 import { describe, expect, it } from 'vitest';
-import { ageLabel, daysSince, lapseInfo, metaLine, readMinutes } from '../src/helpers.js';
+import { ageLabel, daysSince, lapseInfo, metaLine, needsText, readMinutes } from '../src/helpers.js';
 import { isoDaysAgo } from './helpers.js';
 
 describe('readMinutes', () => {
@@ -72,5 +72,31 @@ describe('lapseInfo', () => {
 
   it('respects a non-default window', () => {
     expect(lapseInfo({ added_at: isoDaysAgo(1) }, 30).label).toBe('lapses in 29d');
+  });
+});
+
+// §3 "Pull": which items the reader and AddSheet offer to fill in.
+describe('needsText', () => {
+  it('is true for an article whose fetch failed', () => {
+    expect(needsText({ fetch_status: '503', body_text: null })).toBe(true);
+    expect(needsText({ fetch_status: 'non-html', body_text: null })).toBe(true);
+    expect(needsText({ fetch_status: null, body_text: null })).toBe(true);
+  });
+
+  it('is false once the article has text', () => {
+    expect(needsText({ fetch_status: 'ok', body_text: 'Some text.' })).toBe(false);
+    expect(needsText({ fetch_status: 'pasted', body_text: 'Pasted text.' })).toBe(false);
+  });
+
+  it('reads has_text off the duplicate payload', () => {
+    expect(needsText({ fetch_status: '503', has_text: 0 })).toBe(true);
+    expect(needsText({ fetch_status: 'ok', has_text: 1 })).toBe(false);
+  });
+
+  it('does not treat an unknown body as a missing one', () => {
+    // A feed row has no body_text field at all; offering to fill in an
+    // article that already has text would be worse than not offering.
+    expect(needsText({ id: 1, fetch_status: 'ok' })).toBe(false);
+    expect(needsText(null)).toBe(false);
   });
 });

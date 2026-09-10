@@ -104,7 +104,9 @@ export function AppProvider({ children }) {
     if (!data) return;
     const all = [...data.today, ...data.pending, ...data.archive];
     const updated = all.find(a => a.id === id);
-    if (updated) setOpenArticle(updated);
+    // Feed rows carry no `body_text`, so merge rather than replace: the reader
+    // must not lose the article it is showing.
+    if (updated) setOpenArticle(prev => (prev && prev.id === id ? { ...prev, ...updated } : updated));
   }, 'Could not change the star.'), [load, guard]);
 
   const saveNote = useCallback((id, notes) => guard(async () => {

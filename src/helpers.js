@@ -1,12 +1,16 @@
 const DAY_MS = 86400000;
 
 // §3 "Pull": an item whose fetch failed is not a dead end -- it is an item
-// waiting for text. `has_text` comes back on the duplicate payload; a full
-// article carries `body_text` instead.
+// waiting for text. The duplicate payload answers with `has_text`; a full
+// article carries `body_text`. A list row carries neither, and "unknown" must
+// not be read as "missing" -- offering to fill in an article that already has
+// text is worse than not offering at all.
 export function needsText(article) {
   if (!article) return false;
-  const hasText = article.has_text ?? Boolean(article.body_text);
-  return !hasText && article.fetch_status !== 'pasted';
+  if (article.fetch_status === 'pasted') return false;
+  if ('has_text' in article) return !article.has_text;
+  if (article.body_text === undefined) return false;
+  return !article.body_text;
 }
 
 export function daysSince(iso) {
