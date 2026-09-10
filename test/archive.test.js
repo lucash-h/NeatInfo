@@ -5,7 +5,7 @@
 // success criteria 2 and 8.
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env } from 'cloudflare:test';
-import { applySchema, callJson, resetDb, seedArticle } from './helpers.js';
+import { applySchema, call, callJson, resetDb, seedArticle } from './helpers.js';
 import {
   DEFAULT_LIMIT,
   MAX_LIMIT,
@@ -240,5 +240,58 @@ describe('archive filters on /api/feed', () => {
     expect(status).toBe(200);
     expect(body.archive).toEqual([]);
     expect(body.archiveTotal).toBe(0);
+  });
+});
+
+describe('GET /api/facets', () => {
+  it('returns sources and tags with counts that match a direct SQL count', async () => {
+    await seedMixed();
+    const { status, body } = await callJson('/api/facets');
+    expect(status).toBe(200);
+
+    const bySource = Object.fromEntries(body.sources.map((s) => [s.name, s.count]));
+    expect(bySource).toEqual({ 'arxiv.org': 1, 'garden.example': 1, 'news.example': 1 });
+
+    const byTag = Object.fromEntries(body.tags.map((t) => [t.name, t.count]));
+    expect(byTag).toEqual({ ml: 2, papers: 1, garden: 1 });
+
+    const direct = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM article_tag at JOIN tag t ON t.id = at.tag_id
+       WHERE t.name = 'ml'`
+    ).first();
+    expect(byTag.ml).toBe(direct.n);
+  });
+
+  it('counts the whole archive, not one page of it', async () => {
+    for (let i = 0; i < 60; i++) {
+      await seedArchived({ title: `Row ${i}`, source: 'bulk.example', added_at: iso(i + 1) });
+    }
+    const { body } = await callJson('/api/facets');
+    expect(body.sources.find((s) => s.name === 'bulk.example').count).toBe(60);
+  });
+
+  it('describes the archive only -- an unresolved article is not filterable', async () => {
+    await seedArticle({ title: 'Still new', source: 'brandnew.example', status: 'new' });
+    await seedMixed();
+    const { body } = await callJson('/api/facets');
+    expect(body.sources.map((s) => s.name)).not.toContain('brandnew.example');
+  });
+
+  it('reports the earliest added_at as the floor for the date inputs', async () => {
+    const { a } = await seedMixed();
+    const { body } = await callJson('/api/facets');
+    expect(body.earliestAddedAt).toBe(a.added_at);
+  });
+
+  it('is empty rather than broken on an empty archive', async () => {
+    const { status, body } = await callJson('/api/facets');
+    expect(status).toBe(200);
+    expect(body).toEqual({ sources: [], tags: [], earliestAddedAt: null });
+  });
+
+  it('answers in one round trip', async () => {
+    await seedMixed();
+    const res = await call('/api/facets');
+    expect(res.headers.get('content-type')).toContain('application/json');
   });
 });

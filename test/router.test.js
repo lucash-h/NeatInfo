@@ -16,6 +16,7 @@ describe('router', () => {
     const paths = [
       '/api/session',
       '/api/feed',
+      '/api/facets',
       '/api/articles',
       `/api/articles/${id}`,
       `/api/articles/${id}/open`,

@@ -137,6 +137,39 @@ async function getFeed(env, url) {
   });
 }
 
+// The filter bar needs to know what there is to filter by. Deriving that on
+// the client from one page of rows would offer only the sources and tags that
+// happened to be on that page -- the same partial-page lie paging exists to
+// end -- so it is one indexed round trip over the whole archive instead.
+// §3 "Store"
+async function getFacets(env) {
+  const [sources, tags, floor] = await env.DB.batch([
+    env.DB.prepare(
+      `SELECT source AS name, COUNT(*) AS count FROM article
+       WHERE topic_id = ?1 AND status != 'new'
+       GROUP BY source ORDER BY count DESC, source ASC`
+    ).bind(TOPIC_ID),
+    env.DB.prepare(
+      `SELECT t.name AS name, COUNT(*) AS count
+       FROM article_tag at
+       JOIN tag t ON t.id = at.tag_id
+       JOIN article a ON a.id = at.article_id
+       WHERE a.topic_id = ?1 AND a.status != 'new'
+       GROUP BY t.name ORDER BY count DESC, t.name ASC`
+    ).bind(TOPIC_ID),
+    env.DB.prepare(
+      `SELECT MIN(added_at) AS earliest FROM article WHERE topic_id = ?1 AND status != 'new'`
+    ).bind(TOPIC_ID)
+  ]);
+
+  return json({
+    sources: sources.results,
+    tags: tags.results,
+    // The floor for the date inputs: there is nothing to find before it.
+    earliestAddedAt: floor.results[0]?.earliest ?? null
+  });
+}
+
 // ------------------------------------------------------------------ ingest
 
 // Capture greedily at ingest, process lazily forever after. Raw HTML is the
@@ -532,6 +565,7 @@ export default {
 
     try {
       if (path === '/api/feed' && request.method === 'GET') return await getFeed(env, url);
+      if (path === '/api/facets' && request.method === 'GET') return await getFacets(env);
       if (path === '/api/articles' && request.method === 'POST') return await addArticle(env, request);
       if (path === '/api/settings') return await settings(env, request);
       if (path === '/api/export' && request.method === 'GET') return await exportAll(env);
