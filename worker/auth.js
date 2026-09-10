@@ -39,14 +39,25 @@ export function clearCookie() {
   return `${COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
 
+// Split rather than match: the previous regex was built from a template
+// literal, where `\s` collapses to a literal `s`, so it only ever matched the
+// cookie in first position. Cloudflare's own `__cf_bm` precedes ours in
+// production, which broke sign-in intermittently.
+function readCookie(header, name) {
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 1) continue;
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return null;
+}
+
 export async function isAuthed(request, env) {
   if (!env.PASSPHRASE || !env.SESSION_SECRET) return false;
 
-  const header = request.headers.get('cookie') || '';
-  const match = header.match(new RegExp(`(?:^|;\s*)${COOKIE}=([^;]+)`));
-  if (!match) return false;
+  const token = readCookie(request.headers.get('cookie') || '', COOKIE);
+  if (!token) return false;
 
-  const token = match[1];
   const dot = token.lastIndexOf('.');
   if (dot < 1) return false;
 
