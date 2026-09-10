@@ -8,6 +8,8 @@
     "dev:frontend": "vite",
     "dev:worker": "wrangler dev",
     "build": "vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "preview": "vite preview",
     "deploy": "vite build && wrangler deploy",
     "db:local": "wrangler d1 execute neatinfo --local --file=./schema.sql",
@@ -19,8 +21,10 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@vitejs/plugin-react": "^4.4.1",
     "vite": "^6.3.5",
+    "vitest": "^4.1.11",
     "wrangler": "^4.86.0"
   }
 }
