@@ -184,33 +184,95 @@ async function getFacets(env) {
 
 // Capture greedily at ingest, process lazily forever after. Raw HTML is the
 // bulky half, so it goes to R2 and never into D1. §5.2 / §5.3
+
+const RAW_MAX_FILE = 2 * 1024 * 1024;               // 2 MB per object
+const RAW_BUDGET_BYTES = 8 * 1024 * 1024 * 1024;    // stop well before the 10 GB free tier
+const RAW_USAGE_KEY = 'r2_usage_bytes';
+const RAW_USAGE_AT = 'r2_usage_at';
+
+// How many bytes R2 is holding, as last measured. The number lives in D1
+// rather than in an R2 object because D1 is a single writer and
+// `value = value + n` is one atomic statement: the old counter was an R2
+// read-modify-write (`head`, then `put`), so two adds landing together lost
+// one of the two counts, and a deleted object never subtracted. §5.2
+async function cachedRawUsage(env) {
+  const row = await env.DB.prepare(`SELECT value FROM setting WHERE key = ?1`)
+    .bind(RAW_USAGE_KEY).first();
+  const n = Number(row?.value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+async function bumpRawUsage(env, delta) {
+  await env.DB.prepare(
+    `INSERT INTO setting (key, value) VALUES (?1, ?2)
+     ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(setting.value AS INTEGER) + ?3 AS TEXT)`
+  ).bind(RAW_USAGE_KEY, String(delta), delta).run();
+}
+
+// The authoritative figure: page the bucket and add the sizes up. This is the
+// only thing that can see a deletion, so it is what /api/settings reports and
+// what the cache is refreshed from. It costs one list call per 1,000 objects,
+// which is why the ingest path reads the cache instead.
+async function measureRawUsage(env) {
+  if (!env.RAW) return null;
+  let bytes = 0;
+  let cursor;
+  do {
+    const page = await env.RAW.list({ limit: 1000, cursor });
+    for (const object of page.objects) bytes += object.size;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(RAW_USAGE_KEY, String(bytes)),
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(RAW_USAGE_AT, nowIso())
+  ]);
+
+  return bytes;
+}
+
 // Returns the key, or null when the copy could not be kept -- losing the raw
 // copy must never lose the article.
+//
+// The R2 cost of an add is exactly one operation: the `put`. The budget check
+// is a D1 read, and the counter update is a D1 write.
 async function captureRaw(env, html) {
   if (!env.RAW || !html) return null;
 
   const htmlBytes = new TextEncoder().encode(html).byteLength;
-  const MAX_FILE = 2 * 1024 * 1024;    // 2 MB per file
-  const BUDGET_GB = 8;                  // stop well before the 10 GB free tier
-  if (htmlBytes > MAX_FILE) return null;
+  if (htmlBytes > RAW_MAX_FILE) return null;
 
-  try {
-    const usage = await env.RAW.head('_usage');
-    const stored = Number(usage?.customMetadata?.bytes || '0');
-    if (stored + htmlBytes > BUDGET_GB * 1024 * 1024 * 1024) return null;
-  } catch {}
+  let stored = await cachedRawUsage(env);
+  if (stored === null) {
+    // First capture after a deploy or a reset: measure once, then the cache
+    // carries it. A measurement that fails must not block the capture -- the
+    // put below will fail too if R2 is really down.
+    stored = await measureRawUsage(env).catch(() => null);
+  }
+  if (stored !== null && stored + htmlBytes > RAW_BUDGET_BYTES) {
+    // Only at the ceiling is the exact number worth paying for: the cache can
+    // only ever over-count (deletions), and a stale over-count must not refuse
+    // a capture that would actually fit.
+    const exact = await measureRawUsage(env).catch(() => null);
+    if (exact !== null && exact + htmlBytes > RAW_BUDGET_BYTES) return null;
+  }
 
   const key = `raw/${Date.now()}-${crypto.randomUUID()}.html`;
   try {
     await env.RAW.put(key, html, { httpMetadata: { contentType: 'text/html' } });
-    // Update the running total (V1-19 replaces this read-modify-write).
-    const prev = await env.RAW.head('_usage').catch(() => null);
-    const prevBytes = Number(prev?.customMetadata?.bytes || '0');
-    await env.RAW.put('_usage', '', { customMetadata: { bytes: String(prevBytes + htmlBytes) } });
-    return key;
   } catch {
     return null;
   }
+  // Outside the try: a counter that failed to move is a stale number, not a
+  // lost article, and /api/settings re-measures anyway.
+  await bumpRawUsage(env, htmlBytes).catch(() => {});
+  return key;
 }
 
 async function addArticle(env, request) {
@@ -510,14 +572,19 @@ async function settings(env, request) {
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`
     ).bind(String(Math.round(n))).run();
   }
-  let r2UsageMb = null;
+  // Measured here rather than counted at ingest, because only a walk of the
+  // bucket can see an object that was deleted. Settings is opened rarely and
+  // the archive is ~1,800 objects a year, so this is one list call. §5.2
+  let r2UsageBytes = null;
   if (env.RAW) {
-    try {
-      const meta = await env.RAW.head('_usage');
-      r2UsageMb = Math.round(Number(meta?.customMetadata?.bytes || '0') / 1024 / 1024);
-    } catch {}
+    r2UsageBytes = await measureRawUsage(env).catch(() => cachedRawUsage(env));
   }
-  return json({ lapseWindowDays: await lapseWindow(env), r2UsageMb, r2BudgetMb: 8 * 1024 });
+  return json({
+    lapseWindowDays: await lapseWindow(env),
+    r2UsageBytes,
+    r2UsageMb: r2UsageBytes === null ? null : Math.round(r2UsageBytes / 1024 / 1024),
+    r2BudgetMb: RAW_BUDGET_BYTES / 1024 / 1024
+  });
 }
 
 // Losing the archive deletes the project's entire value, so export ships in

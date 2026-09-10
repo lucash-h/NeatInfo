@@ -1,10 +1,17 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { api } from '../api';
 import { useApp } from '../AppContext';
 
 export default function SettingsSheet({ visible, onClose }) {
   const { feed, load, toast } = useApp();
   const [value, setValue] = useState(feed.lapseWindowDays);
+  // What R2 is actually holding, measured when the sheet opens. §5.2
+  const [usage, setUsage] = useState(null);
+
+  useEffect(() => {
+    if (!visible) return;
+    api('/api/settings').then(setUsage).catch(() => {});
+  }, [visible]);
 
   if (!visible) return null;
 
@@ -46,6 +53,11 @@ export default function SettingsSheet({ visible, onClose }) {
             value={value} onChange={e => setValue(e.target.value)} />
         </label>
         <button className="btn btn-primary btn-tall" type="submit">Save</button>
+        {usage && usage.r2UsageMb !== null && (
+          <p className="field-hint">
+            Raw page copies in R2 · {usage.r2UsageMb} MB of {Math.round(usage.r2BudgetMb / 1024)} GB
+          </p>
+        )}
         <div className="sheet-alt">
           <a className="link-btn" href="/api/export">Export everything as JSON</a>
           <button className="link-btn muted" type="button" onClick={signOut}>Sign out</button>

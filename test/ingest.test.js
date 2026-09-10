@@ -235,7 +235,6 @@ describe('rejected input', () => {
 // goes to R2, never into D1. §5.2 / §5.3
 describe('raw HTML capture', () => {
   it('stores the raw page in R2 and records the key', async () => {
-    await env.RAW.delete('_usage');
     stubFetch(async () => htmlResponse(page()));
     const { body } = await add({ url: 'https://example.com/post' });
 

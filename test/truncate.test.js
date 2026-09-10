@@ -91,7 +91,6 @@ describe('adding an article whose body is over the cap', () => {
   });
 
   it('truncates an over-cap page fetched from a URL, and still keeps the raw HTML', async () => {
-    await env.RAW.delete('_usage');
     const html = `<!doctype html><html><head><title>Enormous</title></head><body><article>` +
       `<p>${OVER_CAP.slice(0, 700 * 1024)}</p></article></body></html>`;
     vi.stubGlobal('fetch', async () =>
