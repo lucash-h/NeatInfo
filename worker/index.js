@@ -638,6 +638,12 @@ async function exportAll(env) {
   const tags = await env.DB.prepare(
     `SELECT at.article_id, t.name FROM article_tag at JOIN tag t ON t.id = at.tag_id`
   ).all();
+  const settings = await env.DB.prepare(`SELECT key, value FROM setting ORDER BY key`).all();
+  const topics = await env.DB.prepare(`SELECT * FROM topic ORDER BY id`).all();
+  // A manifest of what the export expects to find in R2, not the blobs
+  // themselves -- a restore reads this to know what raw captures are missing,
+  // it does not re-upload them. §3 "Store"
+  const rawHtmlKeys = articles.results.map((a) => a.raw_html_key).filter((k) => k != null);
 
   const body = JSON.stringify(
     {
@@ -645,7 +651,10 @@ async function exportAll(env) {
       schema_version: 1,
       articles: articles.results,
       events: events.results,
-      article_tags: tags.results
+      article_tags: tags.results,
+      settings: settings.results,
+      topics: topics.results,
+      raw_html_keys: rawHtmlKeys
     },
     null,
     2
