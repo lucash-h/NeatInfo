@@ -24,6 +24,11 @@ async function lapseWindow(env) {
   return Number.isFinite(n) && n > 0 ? n : 14;
 }
 
+// Rows per lapse batch. Each row contributes two statements, so this is 100
+// statements a batch -- the same order as the 100 bound-variable ceiling that
+// broke the 200-row archive page in V1-18.
+const LAPSE_CHUNK = 50;
+
 // §2.6 derives the surfaces at read time so there is no cron and no timezone
 // bug. §9.4 wants lapse to be a real transition anyway, so it is written here,
 // lazily, the first time a read notices an item has aged out.
@@ -36,14 +41,21 @@ async function applyLapses(env, days) {
   if (!results.length) return 0;
 
   const ts = nowIso();
-  const statements = [];
-  for (const { id } of results) {
-    statements.push(
-      env.DB.prepare(`UPDATE article SET status = 'lapsed', resolved_at = ?2 WHERE id = ?1`).bind(id, ts),
-      env.DB.prepare(`INSERT INTO event (article_id, type, created_at) VALUES (?1, 'lapsed', ?2)`).bind(id, ts)
-    );
+  // Two statements per lapsed row, and the row set is however many items aged
+  // out since the last read. At five a day that is a handful; after a month
+  // away it is a few hundred, and after a restore of an old archive it is the
+  // whole table in one batch. Nothing in D1 promises to accept a batch of
+  // arbitrary size, so it is chunked and the loop carries the rest. §9.4
+  for (let i = 0; i < results.length; i += LAPSE_CHUNK) {
+    const statements = [];
+    for (const { id } of results.slice(i, i + LAPSE_CHUNK)) {
+      statements.push(
+        env.DB.prepare(`UPDATE article SET status = 'lapsed', resolved_at = ?2 WHERE id = ?1`).bind(id, ts),
+        env.DB.prepare(`INSERT INTO event (article_id, type, created_at) VALUES (?1, 'lapsed', ?2)`).bind(id, ts)
+      );
+    }
+    await env.DB.batch(statements);
   }
-  await env.DB.batch(statements);
   return results.length;
 }
 

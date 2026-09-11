@@ -151,6 +151,55 @@ describe('lapse', () => {
     expect(await countEvents(id, 'lapsed')).toBe(1);
   });
 
+  // V1-27: the batch is two statements per lapsed row and the row set is
+  // whatever aged out since the last read -- after a month away, or after
+  // restoring an old export, that is not five rows. It is chunked at 50 rows
+  // (100 statements) and the loop carries the rest. G14 called this "works,
+  // untested"; these are the boundary.
+  async function seedLapsable(n) {
+    const ids = [];
+    for (let i = 0; i < n; i += 1) {
+      const { id } = await seedArticle({ title: `aged ${i}`, added_at: isoDaysAgo(20 + i) });
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  it('lapses a batch that is exactly one chunk', async () => {
+    const ids = await seedLapsable(50);
+    const { body } = await feed({ limit: '200' });
+    expect(body.pending).toHaveLength(0);
+    expect(body.archiveTotal).toBe(50);
+    for (const id of ids) expect(await countEvents(id, 'lapsed')).toBe(1);
+  });
+
+  it('lapses a batch one row past a chunk, which is where an uncapped batch would have been the only path', async () => {
+    const ids = await seedLapsable(51);
+    const { body } = await feed({ limit: '200' });
+    expect(body.pending).toHaveLength(0);
+    expect(body.archiveTotal).toBe(51);
+    const events = await env.DB.prepare(`SELECT COUNT(*) AS n FROM event WHERE type = 'lapsed'`).first();
+    expect(events.n).toBe(51);
+    for (const id of ids) expect(await countEvents(id, 'lapsed')).toBe(1);
+  });
+
+  it('lapses several chunks in one read and still writes exactly one event each', async () => {
+    await seedLapsable(120);
+    const { body } = await feed({ limit: '200' });
+    expect(body.archiveTotal).toBe(120);
+    const rows = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM article WHERE status = 'lapsed' AND resolved_at IS NOT NULL`
+    ).first();
+    expect(rows.n).toBe(120);
+    const events = await env.DB.prepare(`SELECT COUNT(*) AS n FROM event WHERE type = 'lapsed'`).first();
+    expect(events.n).toBe(120);
+
+    // And the second read is still a no-op, however many chunks the first took.
+    await feed();
+    const again = await env.DB.prepare(`SELECT COUNT(*) AS n FROM event WHERE type = 'lapsed'`).first();
+    expect(again.n).toBe(120);
+  });
+
   it('lapses on any read, so no cron job is needed', async () => {
     const { id } = await seedArticle({ added_at: isoDaysAgo(15) });
     const before = await env.DB.prepare(`SELECT status FROM article WHERE id = ?1`).bind(id).first();
