@@ -118,3 +118,80 @@ export function activeFilters(filters = EMPTY_FILTERS, surface = 'archive') {
   if (f.to) out.push({ key: 'to', label: 'to ' + f.to });
   return out;
 }
+
+// -------------------------------------------------------- empty states
+//
+// V1-23: which empty message a surface shows is a decision, not a string
+// literal, and it is the one part of this task that can be unit-tested --
+// there is no jsdom here, so the components stay dumb renderers of whatever
+// shape these return.
+
+// Pending's total arrives unfiltered from the worker (`pendingTotal` counts
+// every row with status='new' and added_at before today, before the
+// opened/unopened split is applied -- see worker/index.js). That is what lets
+// this tell "nothing pending, full stop" apart from "this filter has nothing
+// under it" without a second round trip.
+export function pendingEmptyState({ filter, pendingTotal }) {
+  if (!pendingTotal) {
+    return {
+      title: 'Pending is empty.',
+      note: 'Nothing is waiting on a decision. New articles land in Today first.',
+    };
+  }
+  if (filter === 'opened') {
+    return {
+      title: 'Nothing opened yet.',
+      note: 'Everything pending is still unopened. Try "Never opened", or clear the filter.',
+    };
+  }
+  if (filter === 'unopened') {
+    return {
+      title: 'Nothing left unopened.',
+      note: 'Everything pending has been opened at least once. Try "Opened", or clear the filter.',
+    };
+  }
+  // The "all" filter and a nonzero total should always have rows to show; this
+  // is only a fallback in case that ever stops being true.
+  return { title: 'Nothing here.', note: 'Nothing matches this filter.' };
+}
+
+// Unlike Pending's, the archive's total (`archiveTotal`) is already counted
+// under the active filters and search -- the worker's count query shares the
+// same predicate as the row query (§2.2, §3 "Store"). So when nothing is
+// active, that total IS the true, unfiltered count, and a zero there really
+// means "nothing archived (or starred) yet" rather than "no matches."
+export function archiveEmptyState({ surface, filters, query, archiveTotal }) {
+  if (archiveTotal) return null;
+  const hasFilters = activeFilters(filters, surface).length > 0;
+  const term = (query || '').trim();
+  const searching = Boolean(term);
+
+  if (searching && hasFilters) {
+    return {
+      title: 'No matches.',
+      note: `Nothing under the active filters matches "${term}". Clear the search or the filters to see more.`,
+    };
+  }
+  if (searching) {
+    return {
+      title: 'No matches.',
+      note: `Nothing matches "${term}". Clear the search to see everything here.`,
+    };
+  }
+  if (hasFilters) {
+    return {
+      title: 'Nothing matches these filters.',
+      note: 'Clear or widen the filters to see more.',
+    };
+  }
+  if (surface === 'starred') {
+    return {
+      title: 'Nothing starred yet.',
+      note: 'Star an article while reading it and it will show up here.',
+    };
+  }
+  return {
+    title: 'Archive is empty.',
+    note: 'Kept, dismissed and lapsed articles collect here. Nothing has happened yet.',
+  };
+}

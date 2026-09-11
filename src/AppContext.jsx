@@ -29,6 +29,16 @@ export function AppProvider({ children }) {
   // rest of the feed is replaced wholesale on every load.
   const [archiveRows, setArchiveRows] = useState([]);
   const [loadingMore, setLoadingMore] = useState(false);
+  // V1-23: `initialLoading` is true until the very first `load()` settles, so
+  // a surface with nothing on screen yet can say "loading" instead of "empty".
+  // `loading` covers every *foreground* load after that (a surface switch, a
+  // filter change, the debounced archive search) so those can show a quiet
+  // in-place indicator. Actions that already have rows to show and just
+  // refresh them in the background (resolve, toggleStar, fillArticle,
+  // refetch) pass `background: true` and skip both -- otherwise every keep or
+  // dismiss would flash the list the user is mid-read on.
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [openArticle, setOpenArticle] = useState(null);
   const [toastMsg, setToastMsg] = useState(null);
   const toastTimer = useRef();
@@ -68,19 +78,25 @@ export function AppProvider({ children }) {
   // Any load is page one: a filter or a search that kept the old offset would
   // show a slice of a result set the user is no longer looking at.
   const load = useCallback((opts = {}) => guard(async () => {
-    const params = archiveQueryString({
-      dayStart: localDayStart(),
-      filter: opts.filter ?? filter,
-      query: opts.query ?? query,
-      filters: opts.filters ?? filters,
-      surface: opts.surface ?? surface,
-      offset: 0,
-      limit: ARCHIVE_PAGE,
-    });
-    const data = await api(`/api/feed?${params}`);
-    setFeed(data);
-    setArchiveRows(data.archive);
-    return data;
+    if (!opts.background) setLoading(true);
+    try {
+      const params = archiveQueryString({
+        dayStart: localDayStart(),
+        filter: opts.filter ?? filter,
+        query: opts.query ?? query,
+        filters: opts.filters ?? filters,
+        surface: opts.surface ?? surface,
+        offset: 0,
+        limit: ARCHIVE_PAGE,
+      });
+      const data = await api(`/api/feed?${params}`);
+      setFeed(data);
+      setArchiveRows(data.archive);
+      return data;
+    } finally {
+      if (!opts.background) setLoading(false);
+      setInitialLoading(false);
+    }
   }, 'Could not load the feed.'), [query, filter, filters, surface, guard]);
 
   // The next page, appended. The total beside the rows is the server's
@@ -169,7 +185,10 @@ export function AppProvider({ children }) {
     });
     toast(favorite ? 'Starred and archived' : status === 'kept' ? 'Kept' : 'Dismissed');
     setOpenArticle(null);
-    await load();
+    // Background: the surface the user is looking at already has rows on
+    // screen, this only refreshes them -- showing a loading state here would
+    // flash the list on every single keep or dismiss.
+    await load({ background: true });
   }, 'Could not save that decision.'), [load, toast, guard]);
 
   const toggleStar = useCallback((id, favorite) => guard(async () => {
@@ -177,7 +196,7 @@ export function AppProvider({ children }) {
       method: 'POST',
       body: JSON.stringify({ favorite }),
     });
-    const data = await load();
+    const data = await load({ background: true });
     if (!data) return;
     const all = [...data.today, ...data.pending, ...data.archive];
     const updated = all.find(a => a.id === id);
@@ -204,7 +223,7 @@ export function AppProvider({ children }) {
     // D1 will not hold more than ~1 MB in a value, so a very long paste is cut
     // at 512 KB rather than lost. Say so instead of silently keeping half. §5.2
     toast(bodyTruncated ? 'Saved — only the first 512 KB of that text was kept' : 'Filled in');
-    await load();
+    await load({ background: true });
     return article;
   }, 'Could not save that text.'), [guard, load, toast]);
 
@@ -216,7 +235,7 @@ export function AppProvider({ children }) {
       toast('Fetched');
     }
     setOpenArticle(result.article);
-    await load();
+    await load({ background: true });
     return result;
   }, 'Could not fetch that again.'), [guard, load, toast]);
 
@@ -245,7 +264,7 @@ export function AppProvider({ children }) {
 
   const value = {
     feed, surface, filter, query, openArticle, toastMsg,
-    filters, facets, archiveRows, loadingMore,
+    filters, facets, archiveRows, loadingMore, loading, initialLoading,
     load, loadMore, loadFacets, setArchiveFilter, clearFilters, showTag,
     switchSurface, setFilter, setQuery, open, close,
     resolve, toggleStar, saveNote, toast, step, currentList,

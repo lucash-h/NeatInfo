@@ -825,3 +825,22 @@ a:hover { color: var(--slate-link-hover); text-decoration: underline; }
   .sheet-scrim { align-items: center; justify-content: center; }
   .sheet { max-width: 460px; border-radius: 16px; }
 }
+
+/* -------------------------------------------------------------- V1-23 loading */
+
+/* The initial-load placeholder: same box as `.empty` so a surface never jumps
+   in size between "loading" and "nothing here", just quieter than either
+   empty-title/empty-note pair since there is nothing to say yet. */
+.loading-state {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* A reload that already has rows on screen (a filter change, the debounced
+   archive search) gets this instead of the full loading box -- the rows stay
+   put and only this line above them says a request is in flight. */
+.loading-inline {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 500;
+}

@@ -1,6 +1,6 @@
 import { useRef, useCallback, useEffect } from 'react';
 import { useApp } from '../AppContext';
-import { activeFilters } from '../helpers';
+import { activeFilters, archiveEmptyState } from '../helpers';
 import ArchiveRow from './ArchiveRow';
 
 // §3 "Store" asks for filters over date range, source, tag, status and
@@ -18,6 +18,7 @@ export default function Archive({ starredOnly = false }) {
   const {
     archiveRows, feed, query, setQuery, load, loadMore, loadingMore,
     filters, facets, loadFacets, setArchiveFilter, clearFilters, surface,
+    loading, initialLoading,
   } = useApp();
   const timerRef = useRef();
 
@@ -35,6 +36,8 @@ export default function Archive({ starredOnly = false }) {
   }, [setQuery, load]);
 
   const applied = activeFilters(filters, surface);
+  // Null when there are rows, so the JSX below stays a plain conditional.
+  const empty = archiveEmptyState({ surface, filters, query, archiveTotal: feed.archiveTotal });
   const searching = Boolean(query.trim());
   const hasMore = archiveRows.length < feed.archiveTotal;
   const dateFloor = facets.earliestAddedAt ? facets.earliestAddedAt.slice(0, 10) : undefined;
@@ -119,24 +122,40 @@ export default function Archive({ starredOnly = false }) {
         </div>
       </div>
 
-      <div className="dateline archive-count">
-        <span>
-          {archiveRows.length} of {feed.archiveTotal}
-          {applied.length || searching
-            ? ` · filtered by ${[...applied.map(f => f.label), ...(searching ? [`"${query.trim()}"`] : [])].join(', ')}`
-            : ' · nothing deleted'}
-        </span>
-        {(applied.length || searching) && (
-          <button className="link-btn" onClick={clearFilters}>Clear</button>
-        )}
-      </div>
+      {initialLoading ? (
+        <div className="empty loading-state">Loading…</div>
+      ) : (
+        <>
+          <div className="dateline archive-count">
+            <span>
+              {archiveRows.length} of {feed.archiveTotal}
+              {applied.length || searching
+                ? ` · filtered by ${[...applied.map(f => f.label), ...(searching ? [`"${query.trim()}"`] : [])].join(', ')}`
+                : ' · nothing deleted'}
+              {loading && ' · loading…'}
+            </span>
+            {(applied.length || searching) && (
+              <button className="link-btn" onClick={clearFilters}>Clear</button>
+            )}
+          </div>
 
-      {archiveRows.map(a => <ArchiveRow key={a.id} article={a} />)}
+          {!archiveRows.length ? (
+            empty && (
+              <div className="empty">
+                <span className="empty-title">{empty.title}</span>
+                <span className="empty-note">{empty.note}</span>
+              </div>
+            )
+          ) : (
+            archiveRows.map(a => <ArchiveRow key={a.id} article={a} />)
+          )}
 
-      {hasMore && (
-        <button className="btn load-more" onClick={loadMore} disabled={loadingMore}>
-          {loadingMore ? 'Loading…' : `Load more (${feed.archiveTotal - archiveRows.length} left)`}
-        </button>
+          {hasMore && (
+            <button className="btn load-more" onClick={loadMore} disabled={loadingMore}>
+              {loadingMore ? 'Loading…' : `Load more (${feed.archiveTotal - archiveRows.length} left)`}
+            </button>
+          )}
+        </>
       )}
 
       <div className="archive-foot">

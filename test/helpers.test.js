@@ -2,7 +2,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   ageLabel, daysSince, lapseInfo, metaLine, needsText, readMinutes,
-  ARCHIVE_PAGE, EMPTY_FILTERS, activeFilters, archiveQueryString
+  ARCHIVE_PAGE, EMPTY_FILTERS, activeFilters, archiveQueryString,
+  pendingEmptyState, archiveEmptyState
 } from '../src/helpers.js';
 import { isoDaysAgo } from './helpers.js';
 
@@ -162,5 +163,99 @@ describe('activeFilters', () => {
     const f = { ...EMPTY_FILTERS, favorite: true };
     expect(activeFilters(f, 'archive').map((x) => x.key)).toEqual(['favorite']);
     expect(activeFilters(f, 'starred')).toEqual([]);
+  });
+});
+
+// V1-23: which empty message a surface shows. Pure decision logic so it can
+// be tested without jsdom -- the components just render whatever comes back.
+describe('pendingEmptyState', () => {
+  it('says nothing is pending at all when the unfiltered total is zero', () => {
+    expect(pendingEmptyState({ filter: 'all', pendingTotal: 0 })).toEqual({
+      title: 'Pending is empty.',
+      note: 'Nothing is waiting on a decision. New articles land in Today first.',
+    });
+  });
+
+  it('is not fooled by an "opened" or "unopened" filter into saying nothing is pending', () => {
+    // pendingTotal is unfiltered, so a nonzero total plus an empty filtered
+    // list means the filter is the reason, not an actually-empty Pending.
+    expect(pendingEmptyState({ filter: 'opened', pendingTotal: 0 }).title).toBe('Pending is empty.');
+  });
+
+  it('names the "Opened" filter when nothing pending has been opened yet', () => {
+    expect(pendingEmptyState({ filter: 'opened', pendingTotal: 3 })).toEqual({
+      title: 'Nothing opened yet.',
+      note: 'Everything pending is still unopened. Try "Never opened", or clear the filter.',
+    });
+  });
+
+  it('names the "Never opened" filter when everything pending has been opened', () => {
+    expect(pendingEmptyState({ filter: 'unopened', pendingTotal: 3 })).toEqual({
+      title: 'Nothing left unopened.',
+      note: 'Everything pending has been opened at least once. Try "Opened", or clear the filter.',
+    });
+  });
+
+  it('falls back to a plain message for an unrecognized filter with rows unaccounted for', () => {
+    expect(pendingEmptyState({ filter: 'all', pendingTotal: 3 })).toEqual({
+      title: 'Nothing here.',
+      note: 'Nothing matches this filter.',
+    });
+  });
+});
+
+describe('archiveEmptyState', () => {
+  it('returns null when there is nothing to explain', () => {
+    expect(archiveEmptyState({ surface: 'archive', filters: EMPTY_FILTERS, query: '', archiveTotal: 5 })).toBeNull();
+  });
+
+  it('says the archive is empty when nothing is filtered, searched, or archived', () => {
+    expect(archiveEmptyState({ surface: 'archive', filters: EMPTY_FILTERS, query: '', archiveTotal: 0 })).toEqual({
+      title: 'Archive is empty.',
+      note: 'Kept, dismissed and lapsed articles collect here. Nothing has happened yet.',
+    });
+  });
+
+  it('says nothing is starred yet on the Starred surface specifically', () => {
+    expect(archiveEmptyState({ surface: 'starred', filters: EMPTY_FILTERS, query: '', archiveTotal: 0 })).toEqual({
+      title: 'Nothing starred yet.',
+      note: 'Star an article while reading it and it will show up here.',
+    });
+  });
+
+  it('blames the search when a query alone finds nothing', () => {
+    const result = archiveEmptyState({ surface: 'archive', filters: EMPTY_FILTERS, query: '  quasar  ', archiveTotal: 0 });
+    expect(result.title).toBe('No matches.');
+    expect(result.note).toContain('"quasar"');
+    expect(result.note).toContain('Clear the search');
+  });
+
+  it('blames the filters when they alone find nothing', () => {
+    const filters = { ...EMPTY_FILTERS, status: 'lapsed' };
+    expect(archiveEmptyState({ surface: 'archive', filters, query: '', archiveTotal: 0 })).toEqual({
+      title: 'Nothing matches these filters.',
+      note: 'Clear or widen the filters to see more.',
+    });
+  });
+
+  it('names both the search and the filters when they are combined', () => {
+    const filters = { ...EMPTY_FILTERS, tag: 'ml' };
+    const result = archiveEmptyState({ surface: 'archive', filters, query: 'quasar', archiveTotal: 0 });
+    expect(result.title).toBe('No matches.');
+    expect(result.note).toContain('"quasar"');
+    expect(result.note).toContain('filters');
+  });
+
+  it('treats the Starred favorite filter as the surface, not an active filter, when nothing else narrows it', () => {
+    // On Starred, `favorite: true` is implicit and activeFilters() excludes it,
+    // so a bare Starred surface with zero rows is "nothing starred yet", not
+    // "nothing matches these filters".
+    const filters = { ...EMPTY_FILTERS, favorite: true };
+    expect(archiveEmptyState({ surface: 'starred', filters, query: '', archiveTotal: 0 }).title).toBe('Nothing starred yet.');
+  });
+
+  it('still reports a filter-driven empty state on Starred when a real filter is active', () => {
+    const filters = { ...EMPTY_FILTERS, favorite: true, source: 'arxiv.org' };
+    expect(archiveEmptyState({ surface: 'starred', filters, query: '', archiveTotal: 0 }).title).toBe('Nothing matches these filters.');
   });
 });
