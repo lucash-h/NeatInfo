@@ -16,6 +16,12 @@ jobs:
 
       - run: npm ci
 
+      # Gate the deploy on the test suite before anything else touches the
+      # remote: a broken worker must never get as far as `wrangler deploy`, or
+      # even as far as `npm run build`, which is why this runs before the
+      # build step rather than after it.
+      - run: npm test
+
       # dist/ is gitignored, so the assets the Worker serves have to be built here.
       - run: npm run build
 
