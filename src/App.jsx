@@ -8,12 +8,14 @@ import Archive from './components/Archive';
 import Reader from './components/Reader';
 import AddSheet from './components/AddSheet';
 import SettingsSheet from './components/SettingsSheet';
+import Shortcuts from './components/Shortcuts';
 import Toast from './components/Toast';
 
 function Shell() {
   const { feed, surface, switchSurface, load, openArticle, step, resolve, close, showTag, filters, archiveRows } = useApp();
   const [addOpen, setAddOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   // `load` swallows its own failures into a toast, so this cannot reject.
   useEffect(() => { load(); }, []);
@@ -27,31 +29,71 @@ function Shell() {
     }
   }, []);
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts. V1-22 rebound k/l to e/k: `k` used to mean Keep here,
+  // but every reader app anyone has muscle memory from (vim, Gmail, Reader)
+  // uses `k` for "previous item" and `j` for "next" -- so `k` is previous now,
+  // `l` is gone, and Keep moved to `e`. Do not "helpfully" put Keep back on
+  // `k`; that's the collision this rebind exists to fix.
   useEffect(() => {
     function onKey(e) {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      const tag = e.target.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+      const t = e.target;
+      // The old guard only checked INPUT/TEXTAREA, which missed a <select>
+      // (the Archive filter dropdowns) and a contentEditable region.
+      const typing = t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable;
 
       if (e.key === 'Escape') {
+        // Esc is the one key that still fires while typing -- it's the way
+        // out of the search box that `/` focuses.
+        if (typing) { t.blur(); return; }
+        if (helpOpen) { setHelpOpen(false); return; }
         if (addOpen) { setAddOpen(false); return; }
         if (settingsOpen) { setSettingsOpen(false); return; }
         if (openArticle) { close(); return; }
+        return;
       }
 
-      if (e.key === 'j') { e.preventDefault(); step(1); }
-      if (e.key === 'l') { e.preventDefault(); step(-1); }
+      if (typing) return;
 
+      // Bug fix: previously only Escape checked for an open sheet, so e.g.
+      // clicking a button inside the Add sheet left j/k/s/x still stepping or
+      // resolving the article behind it. Nothing but Escape gets past here
+      // while a sheet or this help overlay is open.
+      // `?` is the exception: it toggles, so it has to survive its own guard.
+      if (helpOpen && e.key === '?') { setHelpOpen(false); return; }
+      if (helpOpen || addOpen || settingsOpen) return;
+
+      if (e.key === '?') { setHelpOpen(true); return; }
+      if (e.key === 'a') { setAddOpen(true); return; }
+
+      if (e.key === '/') {
+        e.preventDefault();
+        // Only Archive/Starred render a search box. Rather than doing
+        // nothing on Today/Pending, hop to the archive first -- `/` is meant
+        // to be "go search," not "search, but only from the one surface that
+        // has it."
+        if (surface !== 'archive' && surface !== 'starred') switchSurface('archive');
+        requestAnimationFrame(() => {
+          document.querySelector('.surface input[type="search"]')?.focus();
+        });
+        return;
+      }
+
+      if (e.key === 'j') { e.preventDefault(); step(1); return; }
+      if (e.key === 'k') { e.preventDefault(); step(-1); return; }
+
+      // e/s/x only apply to an item still undecided, matching the Keep/★/
+      // Dismiss buttons in Reader, which are likewise hidden once resolved.
       if (openArticle?.status === 'new') {
-        if (e.key === 'k') { e.preventDefault(); resolve(openArticle.id, 'kept', false); }
-        if (e.key === 's') { e.preventDefault(); resolve(openArticle.id, 'kept', true); }
-        if (e.key === 'x') { e.preventDefault(); resolve(openArticle.id, 'dismissed', false); }
+        if (e.key === 'e') { e.preventDefault(); resolve(openArticle.id, 'kept', false); return; }
+        if (e.key === 's') { e.preventDefault(); resolve(openArticle.id, 'kept', true); return; }
+        if (e.key === 'x') { e.preventDefault(); resolve(openArticle.id, 'dismissed', false); return; }
       }
     }
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [addOpen, settingsOpen, openArticle, step, resolve, close]);
+  }, [addOpen, settingsOpen, helpOpen, openArticle, step, resolve, close, surface, switchSurface]);
 
   // Register service worker
   useEffect(() => {
@@ -150,6 +192,7 @@ function Shell() {
       <Reader />
       <AddSheet visible={addOpen} onClose={() => setAddOpen(false)} />
       <SettingsSheet visible={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <Shortcuts visible={helpOpen} onClose={() => setHelpOpen(false)} />
       <Toast />
     </div>
   );

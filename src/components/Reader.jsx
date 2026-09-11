@@ -82,7 +82,9 @@ export default function Reader() {
         <span className="eyebrow">
           {isNew ? (a.opened_at ? 'opened · undecided' : 'new') : a.status}
         </span>
-        <span className="keyhint">K keep · S star · X dismiss · J / L move</span>
+        {/* V1-22: full list lives in the `?` overlay; this strip only needs
+            enough to be a reminder, not a reference card. */}
+        <span className="keyhint">E keep · S star · X dismiss · <kbd className="kbd">?</kbd> for more</span>
       </div>
 
       <div className="reader-body">

@@ -844,3 +844,41 @@ a:hover { color: var(--slate-link-hover); text-decoration: underline; }
   letter-spacing: normal;
   font-weight: 500;
 }
+
+/* -------------------------------------------------------------- V1-22 shortcuts */
+
+/* A single key, rendered wherever a shortcut is mentioned -- the help
+   overlay's list and the reader's `.keyhint` strip both use it, so a key
+   always looks the same regardless of where it's referenced. */
+.kbd {
+  display: inline-block;
+  min-width: 1.6em;
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--secondary);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.shortcut-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 13.5px;
+  color: var(--body);
+}
+
+.shortcut-row .kbd { flex: none; }
