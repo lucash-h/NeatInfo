@@ -3,6 +3,10 @@ name: Deploy NeatInfo
 on:
   push:
     branches: [main]
+  # Also on a pull request, so the test gate below actually runs *before* a
+  # merge rather than for the first time on main. The deploy steps are skipped
+  # on a PR -- see the conditions on them.
+  pull_request:
 
 jobs:
   deploy:
@@ -25,13 +29,17 @@ jobs:
       # dist/ is gitignored, so the assets the Worker serves have to be built here.
       - run: npm run build
 
+      # Nothing below this line runs on a pull request: a PR gets the tests and
+      # the build, never the remote database or a deploy.
       - name: Apply D1 migrations
+        if: github.event_name == 'push'
         run: npx wrangler d1 execute neatinfo --remote --file=./schema.sql --yes
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Deploy Worker
+        if: github.event_name == 'push'
         run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
