@@ -1,7 +1,7 @@
 # NeatInfo
 
 Implementation of `NeatInfo.dc.html` (Claude Design) against the v1 scope in
-`../NeatInfo_Design_Report.md`: **pull, show, deal with, store.**
+`docs/NeatInfo_Design_Report.md`: **pull, show, deal with, store.**
 
 A single-user reading tracker with three surfaces — **Today** (added today, by
 you), **Pending** (everything else still undecided — older items, and anything
@@ -11,6 +11,27 @@ Anything left in Pending past the lapse window (default 14 days) is
 auto-resolved to `lapsed` so the queue can never become a guilt pile. One
 Cloudflare Worker serves both the API and the built frontend; D1 holds the
 queryable data, R2 holds raw HTML.
+
+## Where things are
+
+Each component has a README covering what it does and the decisions that would
+otherwise look arbitrary. Start with the one you are about to touch.
+
+| | |
+|---|---|
+| [`worker/`](worker/README.md) | The Cloudflare Worker: API, surfaces, ingest, export, speech |
+| [`src/`](src/README.md) | The React frontend, and why logic lives outside components |
+| [`discover/`](discover/README.md) | Finding candidates: RSS + HN, dedup, relevance scoring |
+| [`pipeline/`](pipeline/README.md) | §8 Stage 1: quality features, Python, nightly |
+| [`scripts/`](scripts/README.md) | Standalone tools: seeding, repair, restore, capture checks |
+| [`test/`](test/README.md) | Vitest inside workerd, and what a good test looks like here |
+| [`migrations/`](migrations/README.md) | One-off SQL, and why it is not in `schema.sql` |
+| [`docs/`](docs/) | The PRD, design report, progress log and decision register |
+| [`CLAUDE.md`](CLAUDE.md) | Conventions and architecture decisions, in brief |
+
+**[`docs/PROGRESS.md`](docs/PROGRESS.md) is the decision register** — every
+task, every open question and how it was settled. If you are wondering why
+something is the way it is, it is usually there.
 
 ```
 app/
@@ -56,6 +77,7 @@ app/
     import.mjs              turns an export payload back into SQL
     validate-capture.mjs    §5.4 script: checks raw captures are chunkable for v2
   test/                     the suite, run inside workerd (see "Running the tests")
+  docs/                     PRD, design report, PROGRESS, and the written-up reports
   .github/workflows/deploy.yml   test -> build -> migrate -> deploy, on push to main
 ```
 

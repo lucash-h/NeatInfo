@@ -43,6 +43,7 @@ app/
 │   ├── import.mjs             # export payload -> SQL, for a restore
 │   └── validate-capture.mjs   # checks raw captures are chunkable for v2
 ├── test/             # vitest, running inside workerd
+├── docs/             # PRD, design report, PROGRESS (the decision register)
 ├── vitest.config.js  # @cloudflare/vitest-pool-workers, bindings from wrangler.toml
 ├── .env.example      # copy to .env for the seeding scripts (gitignored)
 ├── wrangler.toml     # D1 + R2 + AI bindings, SPA routing
@@ -53,6 +54,13 @@ app/
     ├── discover.yml  # Cron every 6h: run discovery pipeline
     └── pipeline.yml   # Cron nightly: Stage 1 features
 ```
+
+Every component directory has a README covering its decisions; `README.md` at
+the root indexes them. `docs/PROGRESS.md` is the decision register -- what is
+built, what is not, and how each open question was settled.
+
+The planning documents lived outside the repository until 2026-09-12, which
+meant the project's reasoning had no backup and no history while its code did.
 
 ## Architecture decisions
 
