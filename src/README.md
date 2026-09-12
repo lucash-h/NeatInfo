@@ -1,5 +1,7 @@
 # src/
 
+*Diagrams: [`DIAGRAMS.md`](DIAGRAMS.md) — state flow, and what pressing play does.*
+
 The React 19 frontend, built by Vite into `dist/` and served by the Worker.
 
 | File | What it holds |

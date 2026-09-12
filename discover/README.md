@@ -1,5 +1,7 @@
 # discover/
 
+*Diagrams: [`DIAGRAMS.md`](DIAGRAMS.md) — the funnel, and a run.*
+
 Finds candidate articles and queues them for review. Runs every 6 hours from
 `.github/workflows/discover.yml`.
 

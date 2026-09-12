@@ -1,5 +1,7 @@
 # migrations/
 
+*Diagrams: [`DIAGRAMS.md`](DIAGRAMS.md) — where a schema change goes, and why order matters.*
+
 One-off SQL for databases that already exist. Run by hand, once per database.
 
 ```bash

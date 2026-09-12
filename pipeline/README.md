@@ -1,5 +1,7 @@
 # pipeline/
 
+*Diagrams: [`DIAGRAMS.md`](DIAGRAMS.md) — where Stage 1 sits, and the nightly run.*
+
 Stage 1 of the V2 ladder (design report §8): features derived from an article's
 own text and raw capture, by counting. No AI call, no embeddings, no labels.
 

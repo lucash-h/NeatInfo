@@ -1,5 +1,7 @@
 # worker/
 
+*Diagrams: [`DIAGRAMS.md`](DIAGRAMS.md) — request routing, and ingest step by step.*
+
 The Cloudflare Worker: the API, and the server for the built frontend. One
 deploy, one origin, no cross-origin dance between Pages and an API.
 

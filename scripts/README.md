@@ -1,5 +1,7 @@
 # scripts/
 
+*Diagrams: [`DIAGRAMS.md`](DIAGRAMS.md) — what each tool is for, and seeding step by step.*
+
 Four standalone Node scripts. None of them is part of the deployed Worker, none
 needs a dependency installed, and none runs on Cloudflare — they are the things
 you run *at* a NeatInfo, not *inside* one.

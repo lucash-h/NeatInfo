@@ -14,6 +14,10 @@ queryable data, R2 holds raw HTML.
 
 ## Where things are
 
+**Diagrams:** [`DIAGRAMS.md`](DIAGRAMS.md) has the system flow and a day in the
+life; each component has its own beside its README.
+
+
 Each component has a README covering what it does and the decisions that would
 otherwise look arbitrary. Start with the one you are about to touch.
 

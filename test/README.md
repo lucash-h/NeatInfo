@@ -1,5 +1,7 @@
 # test/
 
+*Diagrams: [`DIAGRAMS.md`](DIAGRAMS.md) — the harness, and one test's life.*
+
 ```bash
 npm test            # one pass
 npm run test:watch
