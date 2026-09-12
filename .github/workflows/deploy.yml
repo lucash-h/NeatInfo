@@ -20,6 +20,11 @@ jobs:
 
       - run: npm ci
 
+      # wrangler.test.toml is generated from wrangler.toml; if they have
+      # drifted, the suite is testing a different environment than the one that
+      # deploys, which is worth failing over.
+      - run: node scripts/sync-test-config.mjs
+
       # Gate the deploy on the test suite before anything else touches the
       # remote: a broken worker must never get as far as `wrangler deploy`, or
       # even as far as `npm run build`, which is why this runs before the

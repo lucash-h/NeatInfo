@@ -2,6 +2,25 @@ import { useState, useEffect } from 'react';
 import { api } from '../api';
 import { useApp } from '../AppContext';
 
+// Two days rather than one: a single missed night is a runner hiccup, two is a
+// pattern worth noticing.
+const STALE_MS = 48 * 60 * 60 * 1000;
+
+function isStale(iso) {
+  const then = new Date(iso).getTime();
+  return Number.isFinite(then) && Date.now() - then > STALE_MS;
+}
+
+function describeAge(iso) {
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return 'at an unknown time';
+  const hours = Math.floor((Date.now() - then) / 3600000);
+  if (hours < 1) return 'just now';
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? 'yesterday' : `${days} days ago`;
+}
+
 export default function SettingsSheet({ visible, onClose }) {
   const { feed, load, toast } = useApp();
   const [value, setValue] = useState(feed.lapseWindowDays);
@@ -53,6 +72,19 @@ export default function SettingsSheet({ visible, onClose }) {
             value={value} onChange={e => setValue(e.target.value)} />
         </label>
         <button className="btn btn-primary btn-tall" type="submit">Save</button>
+        {/* The pipeline runs nightly somewhere else, and its failure mode is
+            silence -- it simply stops and nothing says so (§9.6). This is
+            where you would look, which is why the age is spelled out rather
+            than left as a timestamp to subtract in your head. */}
+        {usage && (
+          <p className="field-hint">
+            {usage.pipelineLastRun
+              ? `Features · ${usage.pipelineLastCount} scored ${describeAge(usage.pipelineLastRun)} at ${usage.pipelineVersion}`
+              : 'Features · the scoring pipeline has not run yet'}
+            {usage.pipelineLastRun && isStale(usage.pipelineLastRun) && ' — that is longer ago than nightly'}
+          </p>
+        )}
+
         {usage && usage.r2UsageMb !== null && (
           <p className="field-hint">
             Raw page copies in R2 · {usage.r2UsageMb} MB of {Math.round(usage.r2BudgetMb / 1024)} GB
