@@ -7,17 +7,24 @@
 // second engine object with the same four methods plus `available`, handed to
 // `setEngine()`. No component changes.
 
-// Chrome stops speaking after roughly fifteen seconds -- of *total speaking
-// time*, not of a single utterance, which is the correction that matters. This
-// file used to say the latter, and chunked to ~8 seconds on that basis; a
-// queue of twenty short utterances hits the same wall as one long one, which
-// is why articles died after a couple of paragraphs. The heartbeat in
-// webSpeechEngine is what actually fixes it. V1-31
+// Chrome stops speaking after roughly fifteen seconds. Whether that limit is
+// per-utterance or across the whole speaking session is not settled here --
+// both models explain the reported symptom, and this file used to assert the
+// second confidently. The heartbeat in webSpeechEngine resets the counter
+// under either, which is what makes playback correct without having to know.
 //
-// The chunking stays: shorter utterances still give smoother progress
-// reporting and a cleaner cancel, and ~220 characters is about eight seconds
-// of speech at the default rate.
-export const CHUNK_CHARS = 220;
+// Chunk size is therefore an audio-quality knob, not a safety mechanism, with
+// one hedge: at 220 characters an ordinary paragraph produced a 14.7s chunk,
+// sitting exactly on the line if the limit turns out to be per-utterance. 150
+// gives a worst case near 10s with no more mid-sentence cuts than 180, while
+// 120 would hard-cut typical sentences (100-140 characters) for no real gain
+// -- a slow voice puts any character count back on the line, because
+// characters are a proxy for seconds and not a constant one.
+//
+// ~15 characters a second at rate 1 is the realistic figure. An earlier
+// comment here said 220 characters was "about eight seconds", which is 27.5
+// chars/s and disagreed with CHARS_PER_SECOND further down this same file.
+export const CHUNK_CHARS = 150;
 
 // Split on sentence ends first, because a chunk boundary mid-sentence is
 // audible; fall back to word boundaries, then to a hard cut for text that has
@@ -74,22 +81,36 @@ export function webSpeechEngine(synth = globalThis.speechSynthesis, { setInterva
   const stopTimer = ci || globalThis.clearInterval;
 
   let beat = null;
+  // Whether the *reader* paused, tracked here rather than read back from
+  // `synth.paused`. Chrome's flag is unreliable, and the stalled state this
+  // heartbeat exists to escape is itself reported as paused by some builds --
+  // so trusting it would suppress the resume in exactly the case that needs
+  // it, while also being the only thing standing between a paused article and
+  // being un-paused by a timer. One unreliable flag cannot serve both needs.
+  let userPaused = false;
 
-  // Every exit from speaking goes through here. A timer left running would
-  // poke a dead synth forever, and on some browsers resume() on an idle synth
-  // restarts the last utterance.
   const stopHeartbeat = () => {
     if (beat === null) return;
     stopTimer(beat);
     beat = null;
   };
 
+  // The interval spans the whole speaking session, not one utterance. The
+  // first version restarted it on every chunk, which made it a defence against
+  // a *per-utterance* limit -- the very model this file rejects. Since a chunk
+  // is at most ~15s and the interval is 10s, it fired at most once per chunk
+  // and usually never, while Chrome's counter ran on across the queue.
   const startHeartbeat = () => {
-    stopHeartbeat();
+    if (beat !== null) return;
     beat = startTimer(() => {
-      // `speaking` stays true while paused, so an article the reader paused is
-      // not dragged back into playing by the heartbeat.
-      if (synth.speaking && !synth.paused) synth.resume();
+      // `pending` matters because the player calls speakNext() synchronously
+      // from `end`: there is a tick where nothing is speaking yet but the next
+      // utterance is already queued.
+      if (!synth.speaking && !synth.pending) {
+        stopHeartbeat();
+        return;
+      }
+      if (!userPaused) synth.resume();
     }, HEARTBEAT_MS);
   };
 
@@ -101,8 +122,14 @@ export function webSpeechEngine(synth = globalThis.speechSynthesis, { setInterva
       utterance.rate = 1;
       if (onBoundary) utterance.addEventListener('boundary', (e) => onBoundary(e.charIndex || 0));
       utterance.addEventListener('end', () => {
-        stopHeartbeat();
+        // The player queues the next chunk synchronously from here, so by the
+        // time onEnd returns the synth is speaking or pending again and the
+        // heartbeat rightly survives. Only a genuinely exhausted queue stops
+        // it. A fast path, not the teardown: the tick stops itself on silence
+        // too, so if that synchronous assumption ever changes this degrades to
+        // a late stop rather than back to a heartbeat that never fires.
         onEnd?.();
+        if (!synth.speaking && !synth.pending) stopHeartbeat();
       });
       utterance.addEventListener('error', (e) => {
         stopHeartbeat();
@@ -111,9 +138,20 @@ export function webSpeechEngine(synth = globalThis.speechSynthesis, { setInterva
       synth.speak(utterance);
       startHeartbeat();
     },
-    pause() { if (available) synth.pause(); },
-    resume() { if (available) synth.resume(); },
+    pause() {
+      userPaused = true;
+      // Speaking time does not accrue while paused, so the heartbeat has
+      // nothing to defend and is stopped rather than left ticking.
+      stopHeartbeat();
+      if (available) synth.pause();
+    },
+    resume() {
+      userPaused = false;
+      if (available) synth.resume();
+      startHeartbeat();
+    },
     cancel() {
+      userPaused = false;
       stopHeartbeat();
       if (available) synth.cancel();
     }
@@ -127,7 +165,9 @@ export function webSpeechEngine(synth = globalThis.speechSynthesis, { setInterva
 // or a long word is never mistaken for a stall.
 const CHARS_PER_SECOND = 15;
 const STALL_GRACE = 4;
-const STALL_FLOOR_MS = 8000;
+// Chrome's remote voices synthesize server-side and can take 1-3s to utter a
+// first sound, which a short final chunk would otherwise run up against.
+const STALL_FLOOR_MS = 12000;
 
 export function stallTimeout(chunk, { charsPerSecond = CHARS_PER_SECOND, grace = STALL_GRACE } = {}) {
   const expected = (String(chunk || '').length / charsPerSecond) * 1000;
@@ -162,9 +202,21 @@ export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) 
     clearWatchdog();
     watchdog = startTimer(() => {
       if (status !== 'playing') return;
+      // stop() nulls handlers before cancelling so a cancel-induced `error`
+      // cannot re-enter and report twice; the watchdog has to do the same.
+      // speakNext's onError has no status guard, and a Tier 2 engine whose
+      // error object carries a .message would toast a second, confusing
+      // message over this one.
+      const notify = handlers.onError;
+      handlers = {};
       status = 'idle';
       engine.cancel();
-      handlers.onError?.(new Error('Speech stopped unexpectedly. Press play to continue.'));
+      // "start over" because that is what pressing play does: status is idle,
+      // so TtsPlayer falls through to speak(), whose first act is stop().
+      // Resuming from the stalled chunk is possible -- chunks and index are
+      // still here -- but is not built, and a message promising what the code
+      // does not do is the exact failure this task exists to correct.
+      notify?.(new Error('Speech stopped unexpectedly. Press play to start over.'));
     }, stallTimeout(chunk));
   };
 

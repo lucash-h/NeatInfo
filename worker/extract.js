@@ -6,36 +6,49 @@ import { isArxivAbs } from './url.js';
 const SKIP = new Set(['script', 'style', 'noscript', 'nav', 'header', 'footer', 'aside', 'form', 'svg']);
 const BLOCKS = 'article p, article li, main p, main li, [role="main"] p, [role="main"] li, body p, body li';
 
-// HTMLRewriter decodes entities inside text nodes but hands back attribute
-// values exactly as written, so everything taken from a <meta content="...">
-// arrived escaped: titles read `Ed Zitron&#39;s` and summaries read
-// `&quot;best software&quot;` while body text, collected through text handlers,
-// was always clean. That asymmetry is the whole bug. V1-30
+// HTMLRewriter hands back both attribute values and text chunks exactly as the
+// page wrote them -- it preserves source bytes, which is correct for a
+// streaming rewriter and is not what this extractor originally assumed. So
+// titles read `Ed Zitron&#39;s`, summaries read `&quot;best software&quot;`,
+// and bodies read `people&#8217;s heads`. Nothing was decoded anywhere. V1-30
 //
-// Only the entities that actually occur in page metadata are handled -- the
-// full HTML5 table is some two thousand names, and anything missed here is
-// left visible rather than mangled, which is the same outcome as before.
-const NAMED = { lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+// Not the full HTML5 table -- that is some two thousand names -- but every
+// entity that turns up in real article metadata. The punctuation set matters
+// most: WordPress emits `&rsquo;` and `&#8217;` interchangeably for the same
+// curly apostrophe, and `&mdash;`/`&hellip;` constantly. Anything not listed is
+// left visible rather than mangled, which is no worse than before.
+const NAMED = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+  rsquo: '’', lsquo: '‘', ldquo: '“', rdquo: '”',
+  mdash: '—', ndash: '–', hellip: '…',
+  // Added because the repair script's audit reported them surviving a decode
+  // over the real archive -- which is what that reporting is for. zwnj is a
+  // zero-width non-joiner used as a soft line-break hint; it decodes to an
+  // invisible character, so the text reads correctly either way, but leaving
+  // the literal "&zwnj;" visible does not.
+  larr: '←', rarr: '→', copy: '©', zwnj: '‌',
+  middot: '·', bull: '•', deg: '°', trade: '™',
+  reg: '®', laquo: '«', raquo: '»', times: '×'
+};
 
+// One pass, deliberately. The first version chained four .replace() calls with
+// `&amp;` last, reasoning that this stopped `&amp;#39;` becoming an apostrophe.
+// It did -- but only for that spelling. `&#38;` and `&#x26;` are also
+// ampersand, they were decoded by the earlier passes, and the raw `&` they
+// emitted was then rescanned by the later ones: `&#38;lt;` came out as `<`,
+// inventing a character the page never contained. A single pass cannot rescan
+// its own output, so the hazard stops being a matter of ordering.
 export function decodeEntities(value) {
   if (typeof value !== 'string' || !value.includes('&')) return value;
 
-  return value
-    // Numeric, decimal and hex. Anything outside the Unicode range, and the
-    // surrogate block, is left as written rather than throwing.
-    .replace(/&#(\d+);/g, (whole, digits) => {
-      const code = Number(digits);
+  return value.replace(
+    /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([a-zA-Z]+));/g,
+    (whole, dec, hex, name) => {
+      if (name) return Object.prototype.hasOwnProperty.call(NAMED, name) ? NAMED[name] : whole;
+      const code = dec ? Number(dec) : parseInt(hex, 16);
       return code > 0 && code <= 0x10ffff ? safeFromCode(code, whole) : whole;
-    })
-    .replace(/&#[xX]([0-9a-fA-F]+);/g, (whole, hex) => {
-      const code = parseInt(hex, 16);
-      return code > 0 && code <= 0x10ffff ? safeFromCode(code, whole) : whole;
-    })
-    .replace(/&(lt|gt|quot|apos|nbsp);/g, (whole, name) => NAMED[name] ?? whole)
-    // Ampersand LAST. Doing it first would turn `&amp;#39;` -- a correctly
-    // escaped literal "&#39;" -- into an apostrophe, inventing content the
-    // page never had.
-    .replace(/&amp;/g, '&');
+    }
+  );
 }
 
 function safeFromCode(code, whole) {

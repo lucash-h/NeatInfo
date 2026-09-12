@@ -2,7 +2,7 @@
 // engine, which is the same seam Tier 2 (R2 audio + Media Session) will use --
 // if this file can swap the engine, so can §6's upgrade.
 import { describe, expect, it } from 'vitest';
-import { chunkText, createPlayer, webSpeechEngine, stallTimeout, CHUNK_CHARS } from '../src/tts.js';
+import { chunkText, createPlayer, webSpeechEngine, stallTimeout, CHUNK_CHARS, HEARTBEAT_MS } from '../src/tts.js';
 
 // Stands in for speechSynthesis: nothing happens until the test says an
 // utterance finished, which is how a real browser behaves.
@@ -186,9 +186,9 @@ describe('the Web Speech engine', () => {
 
 // V1-31. Two failures that both looked like "it just stops".
 describe('the Chrome heartbeat', () => {
-  function fakeSynth({ speaking = true, paused = false } = {}) {
+  function fakeSynth({ speaking = true, paused = false, pending = false } = {}) {
     return {
-      speaking, paused,
+      speaking, paused, pending,
       resumes: 0, cancels: 0, pauses: 0,
       speak() {},
       pause() { this.pauses += 1; },
@@ -197,13 +197,19 @@ describe('the Chrome heartbeat', () => {
     };
   }
 
-  // A controllable clock: the engine takes its timer functions, so no real
-  // time passes and nothing depends on vitest's global fake timers.
+  // A controllable clock. It records the delay it was handed, because a fake
+  // that discards the delay cannot tell HEARTBEAT_MS from ten minutes -- which
+  // is how a heartbeat that restarted on every chunk, and therefore almost
+  // never fired, passed four tests.
   function fakeClock() {
     const timers = new Map();
+    const delays = [];
     let next = 1;
+    // Closure, not `this`: the engine destructures these functions out of the
+    // object, so a method relying on its receiver loses it.
     return {
-      setInterval: (fn) => { timers.set(next, fn); return next++; },
+      delays,
+      setInterval: (fn, ms) => { delays.push(ms); timers.set(next, fn); return next++; },
       clearInterval: (id) => { timers.delete(id); },
       tick: () => { for (const fn of [...timers.values()]) fn(); },
       get count() { return timers.size; }
@@ -225,17 +231,37 @@ describe('the Chrome heartbeat', () => {
   });
 
   it('does not drag a paused article back into playing', () => {
-    // speechSynthesis.speaking stays true while paused, so the heartbeat has
-    // to check `paused` too or pause becomes impossible to hold.
+    // Driven through the real sequence -- speak, then pause -- rather than
+    // constructed already-paused, because pause intent is tracked in the
+    // engine now rather than read back from synth.paused. That flag is
+    // unreliable, and the stalled state this heartbeat exists to escape is
+    // itself reported as paused by some builds, which would have suppressed
+    // the resume in exactly the case that needs it.
+    const synth = fakeSynth({ speaking: true });
+    const clock = fakeClock();
+    globalThis.SpeechSynthesisUtterance = class { addEventListener() {} };
+
+    const engine = webSpeechEngine(synth, clock);
+    engine.speak('some text', {});
+    engine.pause();
+    clock.tick();
+
+    expect(synth.resumes).toBe(0);
+    expect(clock.count).toBe(0);
+  });
+
+  it('resumes the heartbeat on resume, even while synth.paused still reads true', () => {
     const synth = fakeSynth({ speaking: true, paused: true });
     const clock = fakeClock();
     globalThis.SpeechSynthesisUtterance = class { addEventListener() {} };
 
     const engine = webSpeechEngine(synth, clock);
     engine.speak('some text', {});
+    engine.pause();
+    engine.resume();
     clock.tick();
 
-    expect(synth.resumes).toBe(0);
+    expect(synth.resumes).toBeGreaterThan(0);
   });
 
   it('stops the timer on cancel, so nothing pokes a dead synth', () => {
@@ -251,7 +277,55 @@ describe('the Chrome heartbeat', () => {
     expect(clock.count).toBe(0);
   });
 
-  it('stops the timer when the utterance ends or errors', () => {
+  it('uses the documented interval, not merely some interval', () => {
+    const clock = fakeClock();
+    globalThis.SpeechSynthesisUtterance = class { addEventListener() {} };
+
+    webSpeechEngine(fakeSynth(), clock).speak('some text', {});
+
+    expect(clock.delays).toEqual([HEARTBEAT_MS]);
+  });
+
+  it('survives a chunk boundary, because the limit spans the whole queue', () => {
+    // The original bug: `end` tore the timer down and the next speak() built a
+    // fresh one, so the interval restarted every chunk and only fired if a
+    // single chunk ran longer than HEARTBEAT_MS. The browser's counter mean-
+    // while ran on across the queue. The test that used to live here asserted
+    // that teardown as correct.
+    const synth = fakeSynth({ speaking: true, pending: true });
+    const clock = fakeClock();
+    const listeners = {};
+    globalThis.SpeechSynthesisUtterance = class {
+      addEventListener(name, fn) { listeners[name] = fn; }
+    };
+
+    const engine = webSpeechEngine(synth, clock);
+    engine.speak('chunk one', { onEnd() {}, onError() {} });
+    const first = clock.count;
+
+    listeners.end();
+    engine.speak('chunk two', { onEnd() {}, onError() {} });
+
+    expect(clock.count).toBe(first);
+    expect(clock.delays).toEqual([HEARTBEAT_MS]);
+  });
+
+  it('stops once the queue is genuinely exhausted', () => {
+    const synth = fakeSynth({ speaking: false, pending: false });
+    const clock = fakeClock();
+    const listeners = {};
+    globalThis.SpeechSynthesisUtterance = class {
+      addEventListener(name, fn) { listeners[name] = fn; }
+    };
+
+    const engine = webSpeechEngine(synth, clock);
+    engine.speak('the last chunk', { onEnd() {}, onError() {} });
+    listeners.end();
+
+    expect(clock.count).toBe(0);
+  });
+
+  it('stops the timer when the utterance errors', () => {
     const clock = fakeClock();
     const listeners = {};
     globalThis.SpeechSynthesisUtterance = class {
@@ -261,22 +335,34 @@ describe('the Chrome heartbeat', () => {
     const engine = webSpeechEngine(fakeSynth(), clock);
     engine.speak('some text', { onEnd() {}, onError() {} });
     expect(clock.count).toBe(1);
-    listeners.end();
-    expect(clock.count).toBe(0);
-
-    engine.speak('more text', { onEnd() {}, onError() {} });
-    expect(clock.count).toBe(1);
     listeners.error(new Error('nope'));
     expect(clock.count).toBe(0);
+  });
+
+  it('stops the timer when the synth falls silent on its own', () => {
+    // The self-stop that keeps the synchronous fast path from being the only
+    // thing holding the fix up.
+    const synth = fakeSynth({ speaking: false, pending: false });
+    const clock = fakeClock();
+    globalThis.SpeechSynthesisUtterance = class { addEventListener() {} };
+
+    const engine = webSpeechEngine(synth, clock);
+    engine.speak('some text', {});
+    clock.tick();
+
+    expect(clock.count).toBe(0);
+    expect(synth.resumes).toBe(0);
   });
 });
 
 describe('the stall watchdog', () => {
   function fakeClock() {
     const timers = new Map();
+    const delays = [];
     let next = 1;
     return {
-      setTimeout: (fn) => { timers.set(next, fn); return next++; },
+      delays,
+      setTimeout: (fn, ms) => { delays.push(ms); timers.set(next, fn); return next++; },
       clearTimeout: (id) => { timers.delete(id); },
       fire: () => { const all = [...timers.values()]; timers.clear(); all.forEach((fn) => fn()); },
       get count() { return timers.size; }
@@ -349,9 +435,25 @@ describe('the stall watchdog', () => {
     expect(clock.count).toBe(0);
   });
 
+  it('is armed with stallTimeout for the chunk actually being spoken', () => {
+    // Without this, armWatchdog could pass 0 -- firing instantly on every
+    // chunk and breaking playback outright -- and every other test in this
+    // block would still pass, because none of them advances a clock.
+    const engine = fakeEngine();
+    const clock = fakeClock();
+    const player = createPlayer(engine, clock);
+
+    const text = 'A sentence long enough to be worth speaking aloud.';
+    player.speak(text, {});
+
+    const firstChunk = chunkText(text)[0];
+    expect(clock.delays[0]).toBe(stallTimeout(firstChunk));
+    expect(clock.delays[0]).toBeGreaterThan(0);
+  });
+
   it('scales its patience with the length of the chunk', () => {
-    expect(stallTimeout('short')).toBe(8000);                 // the floor
+    expect(stallTimeout('short')).toBe(12000);                // the floor
     const long = stallTimeout('x'.repeat(600));
-    expect(long).toBeGreaterThan(8000);
+    expect(long).toBeGreaterThan(12000);
   });
 });

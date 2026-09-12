@@ -3,31 +3,43 @@
 // heads`. New articles are clean; these are the ones already in the database.
 //
 //   node scripts/repair-entities.mjs                 # dry run, changes nothing
-//   node scripts/repair-entities.mjs --apply         # write the repairs
+//   node scripts/repair-entities.mjs --apply         # decode in place
+//   node scripts/repair-entities.mjs --apply --refetch   # and re-extract, see below
 //
 // Reads NEATINFO_PASSPHRASE / NEATINFO_BASE the same way seed-articles.mjs
 // does: environment first, then a gitignored app/.env.
 //
-// Two repair routes, because the two halves of the problem are not alike:
+// **The repair is a pure local transform.** Every field is decoded from what is
+// already stored and PATCHed back. It needs no network beyond this API, cannot
+// fail halfway through a page load, works for articles whose source now 403s,
+// and produces a known-correct result. `keep_fetch_status: true` is sent with
+// the body so decoding cannot relabel a fetched article as hand-pasted.
 //
-//   Body text  -> refetch. The extractor is fixed, so re-running it produces a
-//                 clean row. PATCHing body_text would work but sets
-//                 fetch_status='pasted', which would relabel two dozen fetched
-//                 articles as hand-pasted and quietly corrupt the one signal
-//                 that says where text came from.
-//   Title and  -> decode locally and PATCH. Needed for pages that no longer
-//   summary       fetch (openai.com answers 403), where refetch cannot help.
+// An earlier version repaired bodies by calling refetch, reasoning that the
+// extractor was fixed so re-running it would produce a clean row. That is true
+// and it is not free: refetch overwrites title, source, summary, body and the
+// raw capture with whatever the URL serves *now* -- a paywall interstitial, a
+// consent wall, a CMS re-render -- and on failure it rewrites `fetch_status`,
+// so an article that is currently 'ok' and now 403s is permanently relabelled
+// as failed. A repair should not be able to lose anything.
 //
-// A refetch that fails leaves the stored row untouched, so the fallback is
-// always safe to attempt afterwards.
+// --refetch keeps that upside as a separate, opt-in second pass, aimed only at
+// rows where re-extraction is the point rather than a side effect: no body, no
+// raw capture, or no author. Those are the cases a local decode genuinely
+// cannot reach. Export first (`GET /api/export`); it is worth the thirty
+// seconds before any pass that rewrites rows.
 
 import { decodeEntities } from '../worker/extract.js';
 
 const DEFAULT_BASE = 'http://localhost:8787';
 
-// Matches the entities the decoder handles. Deliberately the same shape, so
-// "needs repair" and "can be repaired" cannot drift apart.
-const ENTITY = /&(?:lt|gt|quot|apos|nbsp|amp|#\d+|#[xX][0-9a-fA-F]+);/;
+// Any named entity, not only the ones the decoder knows. A row containing
+// `&frobnicate;` should be *reported* even though nothing will repair it --
+// the alternative is a blind spot that matches the decoder's own, where an
+// unhandled entity is not merely unrepaired but not even counted.
+const ANY_ENTITY = /&(?:#\d+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{1,31});/;
+
+const FIELDS = ['title', 'summary', 'source', 'author', 'body_text'];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -55,30 +67,51 @@ async function loadDotEnv(dir) {
   return out;
 }
 
-function affected(article) {
-  const fields = [];
-  if (ENTITY.test(article.title || '')) fields.push('title');
-  if (ENTITY.test(article.summary || '')) fields.push('summary');
-  if (ENTITY.test(article.body_text || '')) fields.push('body');
-  return fields;
+// What is escaped, and what a decode would actually change. A field can
+// contain an entity the decoder does not handle, in which case it is reported
+// as unrepairable rather than silently counted as fixed.
+function inspect(article) {
+  const escaped = [];
+  const repairable = {};
+  const stubborn = [];
+
+  for (const field of FIELDS) {
+    const value = article[field];
+    if (typeof value !== 'string' || !ANY_ENTITY.test(value)) continue;
+    escaped.push(field);
+    const decoded = decodeEntities(value);
+    if (decoded !== value) repairable[field] = decoded;
+    if (ANY_ENTITY.test(decoded)) stubborn.push(field);
+  }
+  return { escaped, repairable, stubborn };
+}
+
+function wantsRefetch(article) {
+  const reasons = [];
+  if (!article.body_text) reasons.push('no body');
+  if (!article.author) reasons.push('no author');
+  return reasons;
 }
 
 async function main() {
   const args = globalThis.process.argv.slice(2);
 
   if (args.includes('--help') || args.includes('-h')) {
-    console.log(`Usage: node scripts/repair-entities.mjs [--apply] [--base <url>] [--delay <ms>]
+    console.log(`Usage: node scripts/repair-entities.mjs [--apply] [--refetch] [--base <url>] [--delay <ms>]
 
-Finds articles whose stored text still contains HTML entities and repairs them.
-Dry run unless --apply is given; a dry run lists every change it would make.
+Decodes HTML entities in stored articles. Dry run unless --apply is given.
 
   --apply        write the repairs (default: report only)
+  --refetch      additionally re-extract rows that a local decode cannot fix
+                 (no body, no author). Overwrites those rows from the live
+                 page, so it is opt-in and runs after the decode pass.
   --base <url>   NeatInfo origin (default .env NEATINFO_BASE, else ${DEFAULT_BASE})
-  --delay <ms>   pause between repairs, since each may refetch a page (default 1000)`);
+  --delay <ms>   pause between writes (default 250; 1000 with --refetch)`);
     return;
   }
 
   const apply = args.includes('--apply');
+  const refetch = args.includes('--refetch');
   const { fileURLToPath } = await import('node:url');
   const { dirname, join } = await import('node:path');
   const appDir = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -87,7 +120,7 @@ Dry run unless --apply is given; a dry run lists every change it would make.
   const flagBase = args.indexOf('--base') === -1 ? null : args[args.indexOf('--base') + 1];
   const base = (flagBase || fromFile.NEATINFO_BASE || DEFAULT_BASE).replace(/\/+$/, '');
   const delayIdx = args.indexOf('--delay');
-  const delay = Number(delayIdx === -1 ? 1000 : args[delayIdx + 1]);
+  const delay = Number(delayIdx === -1 ? (refetch ? 1000 : 250) : args[delayIdx + 1]);
 
   const passphrase = globalThis.process.env.NEATINFO_PASSPHRASE || fromFile.NEATINFO_PASSPHRASE;
   if (!passphrase) {
@@ -102,27 +135,27 @@ Dry run unless --apply is given; a dry run lists every change it would make.
   if (!auth.ok) throw new Error(`Sign-in failed against ${base}: HTTP ${auth.status}.`);
   const cookie = (auth.headers.get('set-cookie') || '').split(';')[0];
 
-  // The feed carries every undecided row; the archive is paged, so both are
-  // walked. A repair that silently skipped the archive would look complete.
-  const seen = new Map();
+  // The feed carries Today and Pending whole; the archive is paged, so it is
+  // walked. A repair that quietly skipped the archive would look complete.
+  const ids = new Set();
   const feed = await (await fetch(`${base}/api/feed?limit=200`, { headers: { cookie } })).json();
-  for (const row of [...feed.today, ...feed.pending, ...feed.archive]) seen.set(row.id, row);
+  for (const row of [...feed.today, ...feed.pending, ...feed.archive]) ids.add(row.id);
 
   let offset = feed.archive.length;
   while (offset < (feed.archiveTotal || 0)) {
     const page = await (await fetch(`${base}/api/feed?limit=200&offset=${offset}`, { headers: { cookie } })).json();
     if (!page.archive?.length) break;
-    for (const row of page.archive) seen.set(row.id, row);
+    for (const row of page.archive) ids.add(row.id);
     offset += page.archive.length;
   }
 
-  console.log(`${seen.size} article(s) to inspect at ${base}.${apply ? '' : '  (dry run)'}\n`);
+  console.log(`${ids.size} article(s) to inspect at ${base}.${apply ? '' : '  (dry run)'}\n`);
 
   const todo = [];
-  for (const id of seen.keys()) {
+  for (const id of ids) {
     const { article } = await (await fetch(`${base}/api/articles/${id}`, { headers: { cookie } })).json();
-    const fields = affected(article);
-    if (fields.length) todo.push({ article, fields });
+    const found = inspect(article);
+    if (found.escaped.length) todo.push({ article, ...found });
   }
 
   if (!todo.length) {
@@ -131,8 +164,15 @@ Dry run unless --apply is given; a dry run lists every change it would make.
   }
 
   console.log(`${todo.length} article(s) affected:\n`);
-  for (const { article, fields } of todo) {
-    console.log(`  #${article.id} [${fields.join(', ')}] ${decodeEntities(article.title || '').slice(0, 60)}`);
+  for (const { article, escaped, stubborn } of todo) {
+    const flag = stubborn.length ? `  [unhandled entity in ${stubborn.join(', ')}]` : '';
+    console.log(`  #${article.id} [${escaped.join(', ')}] ${decodeEntities(article.title || '').slice(0, 55)}${flag}`);
+  }
+
+  const unhandled = todo.filter((t) => t.stubborn.length);
+  if (unhandled.length) {
+    console.log(`\n${unhandled.length} row(s) contain an entity the decoder does not know.`);
+    console.log('Add it to NAMED in worker/extract.js and re-run, rather than leaving it escaped.');
   }
 
   if (!apply) {
@@ -140,63 +180,82 @@ Dry run unless --apply is given; a dry run lists every change it would make.
     return;
   }
 
-  console.log('\nRepairing...\n');
-  const tally = { refetched: 0, patched: 0, failed: 0 };
+  console.log('\nDecoding in place...\n');
+  const tally = { patched: 0, failed: 0, refetched: 0, refetchFailed: 0 };
 
-  for (const [i, { article, fields }] of todo.entries()) {
+  for (const [i, { article, repairable }] of todo.entries()) {
     const label = `${String(i + 1).padStart(3)}/${todo.length} #${article.id}`;
-    let bodyFixed = !fields.includes('body');
-
-    // Route 1: re-extract. Fixes every field at once, and correctly, because
-    // it is the real extractor running over the real page.
-    if (fields.includes('body') && article.url) {
-      try {
-        const res = await fetch(`${base}/api/articles/${article.id}/refetch`, { method: 'POST', headers: { cookie } });
-        const payload = await res.json().catch(() => ({}));
-        if (res.ok && !payload.fetchError) {
-          bodyFixed = true;
-          tally.refetched += 1;
-          console.log(`${label} refetched`);
-        } else {
-          console.log(`${label} refetch failed (${payload.fetchError || res.status}) -- falling back`);
-        }
-      } catch (err) {
-        console.log(`${label} refetch error (${err.message}) -- falling back`);
-      }
+    const fields = Object.keys(repairable);
+    if (!fields.length) {
+      console.log(`${label} nothing decodable`);
+      continue;
     }
 
-    // Route 2: decode what is stored. Always safe, but cannot reach body_text
-    // without relabelling the article as pasted, so the body is left for a
-    // future refetch rather than corrupted now.
-    const patch = {};
-    const freshTitle = decodeEntities(article.title || '');
-    const freshSummary = decodeEntities(article.summary || '');
-    if (fields.includes('title') && freshTitle !== article.title) patch.title = freshTitle;
-    if (fields.includes('summary') && freshSummary !== article.summary) patch.summary = freshSummary;
+    // body_text rides along with keep_fetch_status so a pure decode cannot
+    // relabel the article as pasted.
+    const patch = { ...repairable };
+    if ('body_text' in patch) patch.keep_fetch_status = true;
 
-    if (Object.keys(patch).length) {
-      const res = await fetch(`${base}/api/articles/${article.id}`, {
-        method: 'PATCH',
-        headers: { 'content-type': 'application/json', cookie },
-        body: JSON.stringify(patch)
-      });
-      if (res.ok) {
-        tally.patched += 1;
-        console.log(`${label} patched ${Object.keys(patch).join(', ')}`);
-      } else {
-        tally.failed += 1;
-        console.log(`${label} PATCH FAILED HTTP ${res.status}`);
-      }
+    const res = await fetch(`${base}/api/articles/${article.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie },
+      body: JSON.stringify(patch)
+    });
+
+    if (res.ok) {
+      tally.patched += 1;
+      console.log(`${label} decoded ${fields.join(', ')}`);
+    } else {
+      tally.failed += 1;
+      console.log(`${label} PATCH FAILED HTTP ${res.status}`);
     }
-
-    if (!bodyFixed) {
-      console.log(`${label} body still escaped -- the page could not be refetched`);
-    }
-
     if (i < todo.length - 1) await sleep(delay);
   }
 
-  console.log(`\nRefetched ${tally.refetched}, patched ${tally.patched}, failed ${tally.failed}.`);
+  console.log(`\nDecoded ${tally.patched}, failed ${tally.failed}.`);
+
+  if (!refetch) {
+    console.log('\nRun again with --refetch to re-extract rows a decode cannot fix (no body, no author).');
+    return;
+  }
+
+  // Second pass, opt-in. Re-extraction is a content refresh: its upside is
+  // exactly the reason to run it, and its downside -- overwriting a row from
+  // whatever the URL serves today -- is why it is not part of the repair.
+  const candidates = [];
+  for (const id of ids) {
+    const { article } = await (await fetch(`${base}/api/articles/${id}`, { headers: { cookie } })).json();
+    const reasons = wantsRefetch(article);
+    if (article.url && reasons.length) candidates.push({ article, reasons });
+  }
+
+  if (!candidates.length) {
+    console.log('\nNothing needs re-extraction.');
+    return;
+  }
+
+  console.log(`\nRe-extracting ${candidates.length} row(s)...\n`);
+  for (const [i, { article, reasons }] of candidates.entries()) {
+    const label = `${String(i + 1).padStart(3)}/${candidates.length} #${article.id}`;
+    try {
+      const res = await fetch(`${base}/api/articles/${article.id}/refetch`, { method: 'POST', headers: { cookie } });
+      const payload = await res.json().catch(() => ({}));
+      if (res.ok && !payload.fetchError) {
+        tally.refetched += 1;
+        console.log(`${label} refetched (${reasons.join(', ')})`);
+      } else {
+        tally.refetchFailed += 1;
+        console.log(`${label} refetch failed: ${payload.fetchError || res.status}`);
+      }
+    } catch (err) {
+      tally.refetchFailed += 1;
+      console.log(`${label} refetch error: ${err.message}`);
+    }
+    if (i < candidates.length - 1) await sleep(delay);
+  }
+
+  console.log(`\nRefetched ${tally.refetched}, failed ${tally.refetchFailed}.`);
+  console.log('A failed refetch rewrites fetch_status on that row -- that is refetch, not the decode pass.');
 }
 
 await main().catch((err) => {

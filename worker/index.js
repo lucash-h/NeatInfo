@@ -1,5 +1,5 @@
 import { isAuthed, issueCookie, clearCookie, checkPassphrase } from './auth.js';
-import { extractArticle, summarizeText, countWords, truncateBodyText } from './extract.js';
+import { extractArticle, summarizeText, countWords, truncateBodyText, decodeEntities } from './extract.js';
 import { normalizeUrl, sourceFromUrl } from './url.js';
 import { ftsQuery, buildArchiveQuery, buildArchiveCount, parseArchiveParams } from './search.js';
 
@@ -324,9 +324,15 @@ async function addArticle(env, request) {
   const origin = payload.origin === 'auto' ? 'auto' : 'manual';
   const defer = Boolean(payload.defer);
 
+  // Decoded at the boundary, for the same reason Meta.element decodes: this is
+  // where untrusted text enters. It matters more here than it looks -- RSS is
+  // XML, so `&amp;` is mandatory and `&#8217;` ubiquitous, and discover/ has no
+  // decoding of its own by design (it must stay dependency-free). A caller's
+  // title also *outranks* the extractor's below, so an undecoded one would win
+  // over the clean one extraction just produced. V1-30
   let record = {
-    title: (payload.title || '').trim(),
-    source: (payload.source || '').trim(),
+    title: decodeEntities((payload.title || '').trim()),
+    source: decodeEntities((payload.source || '').trim()),
     author: null,
     published_at: null,
     summary: '',
@@ -485,6 +491,12 @@ async function updateArticle(env, id, request) {
     sets.push('source = ?');
     binds.push(body.source.trim().slice(0, 200));
   }
+  // Author had no route in at all, which left refetch as the only way to
+  // repair one -- and refetch cannot reach a page that now 403s. V1-30
+  if (typeof body.author === 'string' && body.author.trim()) {
+    sets.push('author = ?');
+    binds.push(body.author.trim().slice(0, 300));
+  }
 
   // D8 (V1-30). An explicit summary is the caller stating exactly what it
   // wants -- a repair pass, or an edit -- and it overwrites. That is a
@@ -492,7 +504,11 @@ async function updateArticle(env, id, request) {
   // as a side effect of pasting text and must never overwrite something you
   // have already read. Both behaviours are wanted; they are just not the same
   // request.
-  const explicitSummary = typeof body.summary === 'string' ? body.summary.trim() : null;
+  // Empty is ignored, matching title and source. Blanking a summary is not
+  // something any current caller wants, and an edit form PATCHing {title,
+  // summary} with the box left empty would otherwise destroy it silently.
+  const explicitSummary =
+    typeof body.summary === 'string' && body.summary.trim() ? body.summary.trim() : null;
   if (explicitSummary !== null) {
     sets.push('summary = ?');
     binds.push(explicitSummary.slice(0, 2000));
@@ -504,8 +520,19 @@ async function updateArticle(env, id, request) {
     const capped = truncateBodyText(body.body_text.trim());
     const text = capped.text;
     bodyTruncated = capped.truncated;
-    sets.push('body_text = ?', 'word_count = ?', "fetch_status = 'pasted'", 'fetched_at = ?');
-    binds.push(text, countWords(text), nowIso());
+    // `keep_fetch_status` is for a repair: decoding entities in stored text is
+    // a pure local transform, and relabelling two dozen fetched articles as
+    // hand-pasted would destroy the one signal that says where text came from.
+    // Explicit rather than inferred -- a clever "is this the same text modulo
+    // decoding?" check is how you end up with another comment that is
+    // confidently wrong about what the code does. V1-30
+    if (body.keep_fetch_status === true) {
+      sets.push('body_text = ?', 'word_count = ?');
+      binds.push(text, countWords(text));
+    } else {
+      sets.push('body_text = ?', 'word_count = ?', "fetch_status = 'pasted'", 'fetched_at = ?');
+      binds.push(text, countWords(text), nowIso());
+    }
     // A summary already on the card is not replaced behind the reader's back;
     // an empty one is filled from the pasted text. §3 "Show"
     //
@@ -727,7 +754,11 @@ async function ingestCandidates(env, request) {
   for (const item of items.slice(0, 50)) {
     const url = (item.url || '').trim();
     const normalized = item.url_normalized || url;
-    const title = (item.title || '').trim();
+    // RSS is XML, so `&amp;` is mandatory there and `&#8217;` ubiquitous.
+    // discover/ does no decoding by design -- it stays dependency-free -- so
+    // this is where it has to happen, or the Discover screen renders raw
+    // entities and any candidate promoted to an article carries them in. V1-30
+    const title = decodeEntities((item.title || '').trim());
     if (!url || !title) continue;
 
     statements.push(
@@ -741,9 +772,9 @@ async function ingestCandidates(env, request) {
         url,
         normalized,
         title,
-        (item.summary || '').slice(0, 500),
-        (item.source || '').slice(0, 200),
-        item.author || null,
+        decodeEntities((item.summary || '').trim()).slice(0, 500),
+        decodeEntities((item.source || '').trim()).slice(0, 200),
+        item.author ? decodeEntities(item.author) : null,
         item.published_at || null,
         item.score || 0,
         ts

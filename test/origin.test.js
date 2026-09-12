@@ -236,3 +236,65 @@ describe('explicit summary on PATCH', () => {
     expect(row.summary).toBe('unchanged');
   });
 });
+
+// V1-30 review follow-ups. Each of these covers a route the repair script
+// needs and that nothing else exercises.
+describe('repair routes on PATCH', () => {
+  const patch = (id, payload) =>
+    callJson(`/api/articles/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+
+  it('writes author, which previously had no route in at all', async () => {
+    const { id } = await seedArticle({ author: 'A. Writer &amp; Co.' });
+
+    const { body } = await patch(id, { author: 'A. Writer & Co.' });
+
+    expect(body.article.author).toBe('A. Writer & Co.');
+  });
+
+  it('keeps fetch_status when a body is rewritten as a pure decode', async () => {
+    // The whole reason this flag exists: decoding entities must not relabel a
+    // fetched article as hand-pasted and destroy the provenance signal.
+    const { id } = await seedArticle({ fetch_status: 'ok', body_text: 'people&#8217;s heads' });
+
+    await patch(id, { body_text: "people's heads", keep_fetch_status: true });
+
+    const row = await env.DB.prepare(
+      'SELECT fetch_status, body_text, word_count FROM article WHERE id = ?1'
+    ).bind(id).first();
+    expect(row.fetch_status).toBe('ok');
+    expect(row.body_text).toBe("people's heads");
+    expect(row.word_count).toBe(2);
+  });
+
+  it('still marks a genuine paste as pasted when the flag is absent', async () => {
+    const { id } = await seedArticle({ fetch_status: 'failed' });
+
+    await patch(id, { body_text: 'Text a human pasted in by hand just now.' });
+
+    const row = await env.DB.prepare('SELECT fetch_status FROM article WHERE id = ?1').bind(id).first();
+    expect(row.fetch_status).toBe('pasted');
+  });
+
+  it('ignores an empty summary rather than blanking the field', async () => {
+    // Matches title and source. An edit form PATCHing {title, summary} with
+    // the summary box left empty must not destroy it.
+    const { id } = await seedArticle({ summary: 'worth keeping' });
+
+    await patch(id, { summary: '' });
+    await patch(id, { summary: '   ' });
+
+    const row = await env.DB.prepare('SELECT summary FROM article WHERE id = ?1').bind(id).first();
+    expect(row.summary).toBe('worth keeping');
+  });
+
+  it('decodes a caller-supplied title at ingest, since it outranks the extractor', async () => {
+    // discover/ produces RSS-derived titles, and RSS is XML, so entities are
+    // mandatory there rather than incidental.
+    const res = await callJson('/api/articles', {
+      method: 'POST',
+      body: JSON.stringify({ text: 'Some pasted text.', title: 'Meta&#039;s agent &amp; friends' })
+    });
+
+    expect(res.body.article.title).toBe("Meta's agent & friends");
+  });
+});

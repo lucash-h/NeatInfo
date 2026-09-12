@@ -73,10 +73,32 @@ describe('decodeEntities', () => {
     expect(decodeEntities('&amp;quot;')).toBe('&quot;');
   });
 
+  it('decodes the punctuation entities that dominate real article metadata', () => {
+    // WordPress emits &rsquo; and &#8217; interchangeably for the same curly
+    // apostrophe, and &mdash;/&hellip; constantly. Omitting these did not just
+    // leave them undecoded -- the repair script's audit regex mirrors this
+    // table, so an affected row was not even counted as affected.
+    expect(decodeEntities('Zitron&rsquo;s take')).toBe('Zitron’s take');
+    expect(decodeEntities('a pair &mdash; really')).toBe('a pair — really');
+    expect(decodeEntities('wait&hellip;')).toBe('wait…');
+    expect(decodeEntities('&ldquo;quoted&rdquo;')).toBe('“quoted”');
+  });
+
   it('leaves unknown entities and bare ampersands alone', () => {
-    expect(decodeEntities('Tom &amp; Jerry &mdash; a pair')).toBe('Tom & Jerry &mdash; a pair');
+    expect(decodeEntities('Tom &amp; Jerry &frobnicate; a pair')).toBe('Tom & Jerry &frobnicate; a pair');
     expect(decodeEntities('R&D spending')).toBe('R&D spending');
     expect(decodeEntities('50% & rising')).toBe('50% & rising');
+  });
+
+  it('never rescans its own output, whatever spelling of ampersand is used', () => {
+    // The chained-replace version decoded &#38; in an early pass and let a
+    // later pass re-read the bare & it produced, so `&#38;lt;` became `<` --
+    // inventing a character the page never contained. One pass cannot.
+    expect(decodeEntities('&#38;lt;')).toBe('&lt;');
+    expect(decodeEntities('&#x26;amp;')).toBe('&amp;');
+    expect(decodeEntities('&#38;amp;')).toBe('&amp;');
+    expect(decodeEntities('&amp;#39;')).toBe('&#39;');
+    expect(decodeEntities('&#38;#39;')).toBe('&#39;');
   });
 
   it('refuses nonsense code points rather than throwing or inventing text', () => {

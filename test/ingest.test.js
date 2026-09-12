@@ -441,19 +441,22 @@ describe('HTML entities in metadata', () => {
     expect(body.article.author).toBe('A. Writer & Co.');
   });
 
-  it('leaves body text alone, which was never the broken half', async () => {
-    // Text nodes are decoded by the parser itself. This is here so a future
-    // change that double-decodes the body fails loudly.
+  it('decodes body text exactly once', async () => {
+    // HTMLRewriter does not decode text nodes either -- it preserves source
+    // bytes everywhere -- so the body needs the same treatment as the meta
+    // tags. The fixture is double-escaped on purpose: `&amp;amp;` must come
+    // back as `&amp;`, which fails if nothing decoded it AND fails if
+    // something decoded it twice.
     stubFetch(async () =>
-      htmlResponse(page({ body: 'Tom &amp; Jerry argued about R&amp;D spending for a long while.' }))
+      htmlResponse(page({ body: 'Tom &amp;amp; Jerry argued about escaping for a good long while.' }))
     );
 
     const { body } = await add({ url: 'https://example.com/body-entities' });
     const row = await env.DB.prepare('SELECT body_text FROM article WHERE id = ?1')
       .bind(body.article.id).first();
 
-    expect(row.body_text).toContain('Tom & Jerry');
-    expect(row.body_text).toContain('R&D spending');
+    expect(row.body_text).toContain('Tom &amp; Jerry');
+    expect(row.body_text).not.toContain('Tom & Jerry');
   });
 
   it('decodes an arXiv paper title and abstract', async () => {
