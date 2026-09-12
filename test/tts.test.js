@@ -2,7 +2,7 @@
 // engine, which is the same seam Tier 2 (R2 audio + Media Session) will use --
 // if this file can swap the engine, so can §6's upgrade.
 import { describe, expect, it } from 'vitest';
-import { chunkText, createPlayer, webSpeechEngine, stallTimeout, CHUNK_CHARS, HEARTBEAT_MS } from '../src/tts.js';
+import { chunkText, createPlayer, webSpeechEngine, workersAudioEngine, stallTimeout, CHUNK_CHARS, HEARTBEAT_MS } from '../src/tts.js';
 
 // Stands in for speechSynthesis: nothing happens until the test says an
 // utterance finished, which is how a real browser behaves.
@@ -73,7 +73,7 @@ describe('chunkText', () => {
 });
 
 describe('the player', () => {
-  it('speaks a long article to the end, one chunk at a time', () => {
+  it('speaks a long article to the end, one chunk at a time', async () => {
     // ~5,000 words, the case Chrome's fifteen-second cutoff breaks when the
     // whole article is a single utterance.
     const article = 'Scaling laws describe a smooth relationship between compute and loss. '.repeat(450);
@@ -82,7 +82,7 @@ describe('the player', () => {
 
     let ended = false;
     let progress = 0;
-    player.speak(article, { onEnd: () => { ended = true; }, onProgress: (p) => { progress = p; } });
+    await player.speak(article, { onEnd: () => { ended = true; }, onProgress: (p) => { progress = p; } });
 
     expect(engine.spoken).toHaveLength(1);   // only the first chunk is queued
     expect(player.status()).toBe('playing');
@@ -95,21 +95,21 @@ describe('the player', () => {
     expect(engine.spoken.length).toBeGreaterThan(100);
   });
 
-  it('reports progress from utterance boundaries', () => {
+  it('reports progress from utterance boundaries', async () => {
     const engine = fakeEngine();
     const player = createPlayer(engine);
     const seen = [];
-    player.speak('Alpha beta gamma. '.repeat(40), { onProgress: (p) => seen.push(p) });
+    await player.speak('Alpha beta gamma. '.repeat(40), { onProgress: (p) => seen.push(p) });
 
     engine.boundary(10);
     expect(seen.at(-1)).toBeGreaterThan(0);
     expect(seen.at(-1)).toBeLessThan(1);
   });
 
-  it('pauses and resumes without restarting the article', () => {
+  it('pauses and resumes without restarting the article', async () => {
     const engine = fakeEngine();
     const player = createPlayer(engine);
-    player.speak('Alpha beta gamma. '.repeat(40));
+    await player.speak('Alpha beta gamma. '.repeat(40));
     engine.finish();
     const spokenSoFar = engine.spoken.length;
 
@@ -124,10 +124,10 @@ describe('the player', () => {
     expect(engine.spoken).toHaveLength(spokenSoFar);
   });
 
-  it('stops: cancels the engine and speaks nothing further', () => {
+  it('stops: cancels the engine and speaks nothing further', async () => {
     const engine = fakeEngine();
     const player = createPlayer(engine);
-    player.speak('Alpha beta gamma delta. '.repeat(40));
+    await player.speak('Alpha beta gamma delta. '.repeat(40));
     const spokenSoFar = engine.spoken.length;
 
     expect(player.stop()).toBe(true);
@@ -141,25 +141,25 @@ describe('the player', () => {
     expect(engine.spoken).toHaveLength(spokenSoFar);
   });
 
-  it('never lets two articles talk at once', () => {
+  it('never lets two articles talk at once', async () => {
     const engine = fakeEngine();
     const player = createPlayer(engine);
-    player.speak('The first article. '.repeat(20));
-    player.speak('The second article. '.repeat(20));
+    await player.speak('The first article. '.repeat(20));
+    await player.speak('The second article. '.repeat(20));
     expect(engine.cancels).toBeGreaterThanOrEqual(1);
     expect(engine.spoken.at(-1)).toContain('second');
     engine.playAll();
     expect(engine.spoken.filter((s) => s.includes('first'))).toHaveLength(1);
   });
 
-  it('refuses to start on empty text and reports engine errors', () => {
+  it('refuses to start on empty text and reports engine errors', async () => {
     const engine = fakeEngine();
     const player = createPlayer(engine);
-    expect(player.speak('   ')).toBe(false);
+    expect(await player.speak('   ')).toBe(false);
     expect(player.status()).toBe('idle');
 
     let failure = null;
-    player.speak('Something to say.', { onError: (e) => { failure = e; } });
+    await player.speak('Something to say.', { onError: (e) => { failure = e; } });
     engine.error(new Error('voice unavailable'));
     expect(failure.message).toBe('voice unavailable');
     expect(player.status()).toBe('idle');
@@ -369,14 +369,14 @@ describe('the stall watchdog', () => {
     };
   }
 
-  it('reports an error when the engine goes silent without ending', () => {
+  it('reports an error when the engine goes silent without ending', async () => {
     // The exact shape of the 15-second bug: no end, no error, just silence.
     const engine = fakeEngine();
     const clock = fakeClock();
     const player = createPlayer(engine, clock);
     const errors = [];
 
-    player.speak('A sentence long enough to be worth speaking aloud.', {
+    await player.speak('A sentence long enough to be worth speaking aloud.', {
       onError: (err) => errors.push(err)
     });
     expect(player.status()).toBe('playing');
@@ -389,13 +389,13 @@ describe('the stall watchdog', () => {
     expect(engine.cancels).toBeGreaterThan(0);
   });
 
-  it('does not fire while the engine is making progress', () => {
+  it('does not fire while the engine is making progress', async () => {
     const engine = fakeEngine();
     const clock = fakeClock();
     const player = createPlayer(engine, clock);
     const errors = [];
 
-    player.speak('A sentence long enough to be worth speaking aloud.', {
+    await player.speak('A sentence long enough to be worth speaking aloud.', {
       onError: (err) => errors.push(err)
     });
     // A boundary is proof of life and pushes the deadline out.
@@ -406,13 +406,13 @@ describe('the stall watchdog', () => {
     expect(errors).toHaveLength(0);
   });
 
-  it('does not accuse a paused article of stalling', () => {
+  it('does not accuse a paused article of stalling', async () => {
     const engine = fakeEngine();
     const clock = fakeClock();
     const player = createPlayer(engine, clock);
     const errors = [];
 
-    player.speak('A sentence long enough to be worth speaking aloud.', {
+    await player.speak('A sentence long enough to be worth speaking aloud.', {
       onError: (err) => errors.push(err)
     });
     player.pause();
@@ -422,20 +422,20 @@ describe('the stall watchdog', () => {
     expect(errors).toHaveLength(0);
   });
 
-  it('is disarmed once the whole article finishes', () => {
+  it('is disarmed once the whole article finishes', async () => {
     const engine = fakeEngine();
     const clock = fakeClock();
     const player = createPlayer(engine, clock);
     const errors = [];
 
-    player.speak('One. Two. Three.', { onError: (err) => errors.push(err) });
+    await player.speak('One. Two. Three.', { onError: (err) => errors.push(err) });
     engine.playAll();
 
     expect(player.status()).toBe('done');
     expect(clock.count).toBe(0);
   });
 
-  it('is armed with stallTimeout for the chunk actually being spoken', () => {
+  it('is armed with stallTimeout for the chunk actually being spoken', async () => {
     // Without this, armWatchdog could pass 0 -- firing instantly on every
     // chunk and breaking playback outright -- and every other test in this
     // block would still pass, because none of them advances a clock.
@@ -444,7 +444,7 @@ describe('the stall watchdog', () => {
     const player = createPlayer(engine, clock);
 
     const text = 'A sentence long enough to be worth speaking aloud.';
-    player.speak(text, {});
+    await player.speak(text, {});
 
     const firstChunk = chunkText(text)[0];
     expect(clock.delays[0]).toBe(stallTimeout(firstChunk));
@@ -455,5 +455,144 @@ describe('the stall watchdog', () => {
     expect(stallTimeout('short')).toBe(12000);                // the floor
     const long = stallTimeout('x'.repeat(600));
     expect(long).toBeGreaterThan(12000);
+  });
+});
+
+// V1-32. The Tier 2 engine, driven through a fake <audio> element -- the same
+// approach the fake speech engine above uses, for the same reason: nothing here
+// should need a browser or spend a neuron.
+describe('the server audio engine', () => {
+  function fakeAudio() {
+    const el = {
+      src: null, preload: null, currentTime: 0, duration: 10,
+      plays: 0, pauses: 0, loads: 0, removed: 0,
+      play() { this.plays += 1; return Promise.resolve(); },
+      pause() { this.pauses += 1; },
+      load() { this.loads += 1; },
+      removeAttribute(name) { if (name === 'src') { this.removed += 1; this.src = null; } },
+      onended: null, onerror: null, ontimeupdate: null
+    };
+    return el;
+  }
+
+  const manifest = {
+    available: true, segments: 3, segmentChars: [800, 800, 120],
+    title: 'A Title', source: 'example.com'
+  };
+
+  function build({ json = async () => manifest, audio = fakeAudio() } = {}) {
+    const engine = workersAudioEngine({
+      articleId: 7,
+      fetchJson: json,
+      makeAudio: () => audio,
+      mediaSession: null
+    });
+    return { engine, audio };
+  }
+
+  it('turns the manifest into one unit per segment, carrying real sizes', async () => {
+    const { engine } = build();
+    const units = await engine.prepare(null, { articleId: 7 });
+
+    expect(units).toHaveLength(3);
+    expect(units[0]).toMatchObject({ index: 0, chars: 800, url: '/api/articles/7/audio/0' });
+    expect(units[2]).toMatchObject({ index: 2, chars: 120, url: '/api/articles/7/audio/2' });
+  });
+
+  it('asks the server once, however many times it is prepared', async () => {
+    // The component asks to decide whether server audio is possible; the
+    // player asks again when it starts. That must not be two round trips.
+    let calls = 0;
+    const { engine } = build({ json: async () => { calls += 1; return manifest; } });
+
+    await engine.prepare(null, { articleId: 7 });
+    await engine.prepare(null, { articleId: 7 });
+
+    expect(calls).toBe(1);
+  });
+
+  it('returns null when the server says audio is unavailable', async () => {
+    // Too long, no text, or no AI binding -- an answer, not a failure.
+    const { engine } = build({ json: async () => ({ available: false, reason: 'Too long', segments: 99 }) });
+    expect(await engine.prepare(null, { articleId: 7 })).toBe(null);
+  });
+
+  it('plays a segment by URL and reports progress in characters', async () => {
+    const { engine, audio } = build();
+    const units = await engine.prepare(null, { articleId: 7 });
+    const seen = [];
+
+    engine.speak(units[0], { onBoundary: (n) => seen.push(n) });
+    expect(audio.src).toBe('/api/articles/7/audio/0');
+    expect(audio.plays).toBe(1);
+
+    audio.currentTime = 5;          // halfway through a 10s segment
+    audio.ontimeupdate();
+    expect(seen).toEqual([400]);    // half of the segment's 800 characters
+  });
+
+  it('reports the end of a segment so the player advances', async () => {
+    const { engine, audio } = build();
+    const units = await engine.prepare(null, { articleId: 7 });
+    let ended = false;
+
+    engine.speak(units[0], { onEnd: () => { ended = true; } });
+    audio.onended();
+
+    expect(ended).toBe(true);
+  });
+
+  it('surfaces a failed segment rather than going quiet', async () => {
+    const { engine, audio } = build();
+    const units = await engine.prepare(null, { articleId: 7 });
+    let failure = null;
+
+    engine.speak(units[0], { onError: (err) => { failure = err; } });
+    audio.onerror();
+
+    expect(failure).toBeInstanceOf(Error);
+  });
+
+  it('stops a download in flight when cancelled', async () => {
+    // Without dropping src, an abandoned article keeps pulling audio nobody
+    // will hear -- and at 88 KB a second that is not a small waste.
+    const { engine, audio } = build();
+    const units = await engine.prepare(null, { articleId: 7 });
+
+    engine.speak(units[0], {});
+    engine.cancel();
+
+    expect(audio.pauses).toBeGreaterThan(0);
+    expect(audio.removed).toBe(1);
+    expect(audio.src).toBe(null);
+  });
+
+  it('drives the whole article through the player, segment by segment', async () => {
+    const audio = fakeAudio();
+    const { engine } = build({ audio });
+    const player = createPlayer(engine);
+    let ended = false;
+
+    await player.speak('ignored -- the server holds the text', {
+      articleId: 7,
+      onEnd: () => { ended = true; }
+    });
+
+    expect(audio.src).toBe('/api/articles/7/audio/0');
+    audio.onended();
+    expect(audio.src).toBe('/api/articles/7/audio/1');
+    audio.onended();
+    expect(audio.src).toBe('/api/articles/7/audio/2');
+    audio.onended();
+
+    expect(ended).toBe(true);
+    expect(player.status()).toBe('done');
+  });
+
+  it('refuses to start when the article has no server audio', async () => {
+    const { engine } = build({ json: async () => ({ available: false, segments: 0 }) });
+    const player = createPlayer(engine);
+
+    expect(await player.speak('some text', { articleId: 7 })).toBe(false);
   });
 });

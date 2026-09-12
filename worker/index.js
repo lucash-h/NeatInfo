@@ -2,6 +2,7 @@ import { isAuthed, issueCookie, clearCookie, checkPassphrase } from './auth.js';
 import { extractArticle, summarizeText, countWords, truncateBodyText, decodeEntities } from './extract.js';
 import { normalizeUrl, sourceFromUrl } from './url.js';
 import { ftsQuery, buildArchiveQuery, buildArchiveCount, parseArchiveParams } from './search.js';
+import { segmentText, speechText, generateSegment, MAX_SEGMENTS } from './speech.js';
 
 const TOPIC_ID = 1;
 
@@ -657,6 +658,87 @@ async function getRawHtml(env, id) {
   });
 }
 
+// Tier 2 speech. §6 / V1-32
+//
+// Two routes: a manifest saying how many segments there are, and the audio for
+// one segment. Nothing is cached -- see worker/speech.js for why -- so this is
+// generated on the way to the reader and exists nowhere afterwards.
+
+async function getAudioManifest(env, id) {
+  const row = await env.DB.prepare(
+    `SELECT title, source, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
+  ).bind(id, TOPIC_ID).first();
+  if (!row) return fail(404, 'No such article.');
+
+  if (!env.AI) {
+    // Not an error: the browser voice is the floor, and the client asks this
+    // question precisely so it can fall back without a failed request.
+    return json({ available: false, reason: 'Workers AI is not configured.', segments: 0 });
+  }
+
+  const segments = segmentText(speechText(row));
+  if (!segments.length) return json({ available: false, reason: 'Nothing to read aloud.', segments: 0 });
+
+  // A ceiling per article, so one very long paper cannot quietly spend the
+  // day's neurons. Truncating would be worse than refusing: it would read
+  // three quarters of something and stop without saying why.
+  if (segments.length > MAX_SEGMENTS) {
+    return json({
+      available: false,
+      reason: `Too long to read aloud (${segments.length} segments, limit ${MAX_SEGMENTS}).`,
+      segments: segments.length
+    });
+  }
+
+  return json({
+    available: true,
+    segments: segments.length,
+    // Per-segment lengths, so the client can report progress proportional to
+    // the text rather than counting segments as equal -- the last one is often
+    // a fraction of the others.
+    segmentChars: segments.map((s) => s.length),
+    chars: segments.reduce((n, s) => n + s.length, 0),
+    title: row.title,
+    source: row.source
+  });
+}
+
+async function getAudioSegment(env, id, index) {
+  if (!env.AI) return fail(503, 'Workers AI is not configured.');
+
+  const row = await env.DB.prepare(
+    `SELECT title, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
+  ).bind(id, TOPIC_ID).first();
+  if (!row) return fail(404, 'No such article.');
+
+  const segments = segmentText(speechText(row));
+  if (segments.length > MAX_SEGMENTS) return fail(413, 'Too long to read aloud.');
+  // Out of range is a 404 rather than an empty 200: the client uses the end of
+  // the range to know it has finished, and an empty body would play as silence.
+  if (!Number.isInteger(index) || index < 0 || index >= segments.length) {
+    return fail(404, 'No such segment.');
+  }
+
+  let audio;
+  try {
+    audio = await generateSegment(env, segments[index]);
+  } catch (err) {
+    // The reader falls back to the browser voice on this, so it must be a
+    // clean failure rather than a hang or a half-written body.
+    return fail(502, `Speech generation failed: ${String(err?.message || err)}`);
+  }
+
+  return new Response(audio, {
+    headers: {
+      'content-type': 'audio/wav',
+      // Private and brief. The audio is deterministic for a given text, but
+      // storing it is the thing this design exists to avoid, and a long cache
+      // here would just move the hoard into the browser.
+      'cache-control': 'private, max-age=600'
+    }
+  });
+}
+
 async function getArticle(env, id) {
   const row = await env.DB.prepare(
     `SELECT ${LIST_COLUMNS}, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
@@ -953,7 +1035,14 @@ export default {
         if (candidateMatch[2] === 'skip') return await skipCandidate(env, id);
       }
 
-      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch|raw))?$/);
+      // Audio segments carry an index, so they are matched before the
+      // single-action pattern below.
+      const audioSeg = path.match(/^\/api\/articles\/(\d+)\/audio\/(\d+)$/);
+      if (audioSeg && request.method === 'GET') {
+        return await getAudioSegment(env, Number(audioSeg[1]), Number(audioSeg[2]));
+      }
+
+      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch|raw|audio))?$/);
       if (match) {
         const id = Number(match[1]);
         const action = match[2];
@@ -965,6 +1054,7 @@ export default {
         if (action === 'star' && request.method === 'POST') return await setStar(env, id, request);
         if (action === 'refetch' && request.method === 'POST') return await refetchArticle(env, id);
         if (action === 'raw' && request.method === 'GET') return await getRawHtml(env, id);
+        if (action === 'audio' && request.method === 'GET') return await getAudioManifest(env, id);
         return fail(405, 'Method not allowed.');
       }
 

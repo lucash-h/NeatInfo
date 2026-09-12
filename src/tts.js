@@ -170,8 +170,17 @@ const STALL_GRACE = 4;
 const STALL_FLOOR_MS = 12000;
 
 export function stallTimeout(chunk, { charsPerSecond = CHARS_PER_SECOND, grace = STALL_GRACE } = {}) {
-  const expected = (String(chunk || '').length / charsPerSecond) * 1000;
+  const chars = typeof chunk === 'string' ? chunk.length : (Number(chunk?.chars) || 0);
+  const expected = (chars / charsPerSecond) * 1000;
   return Math.max(STALL_FLOOR_MS, Math.round(expected * grace));
+}
+
+// A unit is either a string (Tier 1) or a descriptor carrying its own size
+// (Tier 2). Progress is reported against real text length either way, so the
+// bar does not jump when a short final segment finishes.
+function unitSize(unit) {
+  if (typeof unit === 'string') return unit.length;
+  return Number(unit?.chars) || 1;
 }
 
 export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) {
@@ -243,7 +252,7 @@ export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) 
         // unless we are still meant to be playing.
         if (status !== 'playing') return;
         clearWatchdog();
-        spoken += chunk.length + 1;
+        spoken += unitSize(chunk) + 1;
         index += 1;
         speakNext();
       },
@@ -270,13 +279,17 @@ export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) 
   return {
     get supported() { return engine.available; },
     status: () => status,
-    speak(text, opts = {}) {
+    // Units are whatever the engine wants to be handed one at a time: strings
+    // of text for the browser voice, `{index, chars}` descriptors for server
+    // audio, where the text lives on the server and only the index travels.
+    // The player never inspects them beyond their size. §6
+    async speak(text, opts = {}) {
       stop();
-      const next = chunkText(text);
-      if (!next.length) return false;
+      const next = engine.prepare ? await engine.prepare(text, opts) : chunkText(text);
+      if (!next || !next.length) return false;
       handlers = opts;
       chunks = next;
-      total = next.join(' ').length || 1;
+      total = next.reduce((n, unit) => n + unitSize(unit), 0) || 1;
       status = 'playing';
       speakNext();
       return true;
@@ -317,4 +330,101 @@ export function setEngine(engine) {
   if (player) player.stop();
   player = createPlayer(engine);
   return player;
+}
+
+// --------------------------------------------------------- Tier 2 engine
+
+// Server-generated speech. §6 / V1-32
+//
+// The Worker synthesises ~60 seconds at a time and stores none of it, so this
+// plays a sequence of short URLs through one <audio> element rather than one
+// long file. That element is what makes a locked iPhone keep playing, which is
+// the real reason this tier exists -- the voice being better is a bonus.
+//
+// `prepare` fetches the manifest, so the player learns the segment count from
+// the server instead of chunking text it would then have to send back.
+export function workersAudioEngine({
+  articleId,
+  fetchJson,
+  makeAudio = () => new globalThis.Audio(),
+  mediaSession = globalThis.navigator?.mediaSession
+} = {}) {
+  let audio = null;
+  let meta = null;
+  // The manifest is fetched once. The component asks for it to decide whether
+  // server audio is possible at all, and the player asks again when it starts
+  // speaking; those must not be two round trips, and must not disagree.
+  let units = null;
+
+  const teardown = () => {
+    if (!audio) return;
+    audio.onended = null;
+    audio.onerror = null;
+    audio.pause();
+    // Dropping the src stops a segment still downloading; without it an
+    // abandoned article keeps pulling audio nobody will hear.
+    audio.removeAttribute('src');
+    audio.load?.();
+    audio = null;
+  };
+
+  return {
+    available: typeof globalThis.Audio === 'function',
+
+    async prepare(text, opts = {}) {
+      if (units) return units;
+      const id = opts.articleId ?? articleId;
+      if (!id) return null;
+      const manifest = await fetchJson(`/api/articles/${id}/audio`);
+      // `available: false` is an answer, not a failure: too long, no text, or
+      // no AI binding. The caller falls back to the browser voice.
+      if (!manifest?.available || !manifest.segments) return null;
+      meta = manifest;
+      units = Array.from({ length: manifest.segments }, (_, index) => ({
+        index,
+        chars: manifest.segmentChars?.[index] ?? 1,
+        url: `/api/articles/${id}/audio/${index}`
+      }));
+      return units;
+    },
+
+    speak(unit, { onEnd, onError, onBoundary } = {}) {
+      teardown();
+      audio = makeAudio();
+      audio.preload = 'auto';
+      audio.src = unit.url;
+
+      // Progress within a segment, reported in characters so it lines up with
+      // the player's text-based total.
+      audio.ontimeupdate = () => {
+        if (!audio?.duration || !Number.isFinite(audio.duration)) return;
+        onBoundary?.(Math.round((audio.currentTime / audio.duration) * unit.chars));
+      };
+      audio.onended = () => onEnd?.();
+      audio.onerror = () => onError?.(new Error('That part of the audio could not be played.'));
+
+      if (mediaSession && meta) {
+        // What the lock screen shows. Set per segment because some browsers
+        // clear it when the element's source changes.
+        try {
+          mediaSession.metadata = new globalThis.MediaMetadata({
+            title: meta.title || 'NeatInfo',
+            artist: meta.source || '',
+            album: 'NeatInfo'
+          });
+        } catch {
+          // MediaMetadata is missing on older browsers; audio still plays.
+        }
+      }
+
+      const started = audio.play?.();
+      // A rejected play() is usually an autoplay block, which is a real error
+      // the reader needs to see rather than silence.
+      if (started?.catch) started.catch((err) => onError?.(err));
+    },
+
+    pause() { audio?.pause(); },
+    resume() { audio?.play?.()?.catch?.(() => {}); },
+    cancel() { teardown(); }
+  };
 }
