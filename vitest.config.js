@@ -11,7 +11,13 @@ export default defineConfig({
       // rollback, so tests share one D1 file. `resetDb()` in test/helpers.js
       // is what makes each test independent -- call it in beforeEach.
       singleWorker: true,
-      wrangler: { configPath: './wrangler.toml' },
+      // wrangler.test.toml, not wrangler.toml: identical except that the
+      // Workers AI binding is removed. AI has no local mode, so declaring it
+      // makes this pool open a remote proxy session requiring
+      // CLOUDFLARE_API_TOKEN -- which would make `npm test` depend on
+      // Cloudflare credentials, including in CI, where the test gate runs
+      // *before* the step that has them. Speech tests stub env.AI themselves.
+      wrangler: { configPath: './wrangler.test.toml' },
       miniflare: {
         // Never the real values; the passphrase and signing key are secrets
         // in production (`wrangler secret put`).

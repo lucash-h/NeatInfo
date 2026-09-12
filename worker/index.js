@@ -831,8 +831,18 @@ async function settings(env, request) {
   if (env.RAW) {
     r2UsageBytes = await measureRawUsage(env).catch(() => cachedRawUsage(env));
   }
+  // The pipeline runs somewhere else, nightly, and its failure mode is silence.
+  // Settings is where you would look.
+  const pipeline = await env.DB.prepare(
+    `SELECT key, value FROM setting WHERE key IN (?1, ?2, ?3)`
+  ).bind(PIPELINE_LAST_RUN, PIPELINE_LAST_COUNT, PIPELINE_LAST_VERSION).all();
+  const marks = Object.fromEntries(pipeline.results.map((r) => [r.key, r.value]));
+
   return json({
     lapseWindowDays: await lapseWindow(env),
+    pipelineLastRun: marks[PIPELINE_LAST_RUN] ?? null,
+    pipelineLastCount: Number(marks[PIPELINE_LAST_COUNT] ?? 0),
+    pipelineVersion: marks[PIPELINE_LAST_VERSION] ?? null,
     r2UsageBytes,
     r2UsageMb: r2UsageBytes === null ? null : Math.round(r2UsageBytes / 1024 / 1024),
     r2BudgetMb: RAW_BUDGET_BYTES / 1024 / 1024
@@ -885,6 +895,104 @@ function checkDiscoverKey(request, env) {
   if (!env.DISCOVER_KEY) return false;
   const header = request.headers.get('x-discover-key') || '';
   return header.length > 0 && header === env.DISCOVER_KEY;
+}
+
+// ------------------------------------------------------- the V2 pipeline
+//
+// §8 Stage 1 runs in GitHub Actions, in Python, because the feature pass loops
+// over megabytes of text and a Worker gets 10ms of CPU per invocation. These
+// two routes are the whole interface: hand out work, take back features.
+//
+// Keyed with the same x-discover-key the candidate ingest uses rather than a
+// second secret. One machine-facing credential is easier to rotate than two,
+// and both callers are the same GitHub Actions runner.
+
+const PIPELINE_LAST_RUN = 'pipeline_last_run';
+const PIPELINE_LAST_COUNT = 'pipeline_last_count';
+const PIPELINE_LAST_VERSION = 'pipeline_last_version';
+
+// Articles that have text and no features at this version. Sending the version
+// means a changed extractor re-does the corpus without anything having to
+// remember which rows are stale.
+async function getPipelineWork(env, url) {
+  const version = (url.searchParams.get('version') || '').trim();
+  if (!version) return fail(400, 'A version is required.');
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 200);
+
+  const { results } = await env.DB.prepare(
+    `SELECT a.id, a.title, a.url, a.source, a.body_text, a.word_count, a.raw_html_key
+     FROM article a
+     WHERE a.topic_id = ?1
+       AND a.body_text IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM article_feature f
+         WHERE f.article_id = a.id AND f.version = ?2
+       )
+     ORDER BY a.id
+     LIMIT ?3`
+  ).bind(TOPIC_ID, version, limit).all();
+
+  const remaining = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM article a
+     WHERE a.topic_id = ?1 AND a.body_text IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM article_feature f WHERE f.article_id = a.id AND f.version = ?2)`
+  ).bind(TOPIC_ID, version).first();
+
+  return json({ version, articles: results, remaining: remaining?.n ?? 0 });
+}
+
+async function putPipelineFeatures(env, request) {
+  const body = await request.json().catch(() => ({}));
+  const rows = body.features;
+  const version = String(body.version || '').trim();
+  if (!version) return fail(400, 'A version is required.');
+  if (!Array.isArray(rows) || !rows.length) return fail(400, 'No features provided.');
+
+  const statements = [];
+  let accepted = 0;
+  for (const row of rows.slice(0, 200)) {
+    const id = Number(row.article_id);
+    if (!Number.isInteger(id)) continue;
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO article_feature (article_id, version, score, explain, payload, computed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(article_id, version) DO UPDATE SET
+           score = excluded.score, explain = excluded.explain,
+           payload = excluded.payload, computed_at = excluded.computed_at`
+      ).bind(
+        id, version,
+        Number(row.score) || 0,
+        String(row.explain || '').slice(0, 500),
+        JSON.stringify(row.payload ?? {}),
+        nowIso()
+      )
+    );
+    accepted += 1;
+  }
+  if (!accepted) return fail(400, 'No usable features provided.');
+
+  // The canary. A nightly job that quietly stops is invisible for a week --
+  // §9.6, and the shape of failure this project has already met twice. The
+  // number is recorded next to the timestamp so "it ran" and "it did anything"
+  // are separate questions.
+  statements.push(
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(PIPELINE_LAST_RUN, nowIso()),
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(PIPELINE_LAST_COUNT, String(accepted)),
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(PIPELINE_LAST_VERSION, version)
+  );
+
+  await env.DB.batch(statements);
+  return json({ accepted, version });
 }
 
 async function ingestCandidates(env, request) {
@@ -1075,6 +1183,13 @@ export default {
     }
 
     // Discovery script authenticates with a shared key, not a cookie.
+    if (path.startsWith('/api/pipeline/')) {
+      if (!checkDiscoverKey(request, env)) return fail(401, 'Bad or missing pipeline key.');
+      if (path === '/api/pipeline/work' && request.method === 'GET') return await getPipelineWork(env, url);
+      if (path === '/api/pipeline/features' && request.method === 'POST') return await putPipelineFeatures(env, request);
+      return fail(404, 'No such endpoint.');
+    }
+
     if (path === '/api/candidates' && request.method === 'POST') {
       if (!checkDiscoverKey(request, env)) return fail(401, 'Invalid discover key.');
       return await ingestCandidates(env, request);

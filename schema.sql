@@ -92,6 +92,28 @@ CREATE TABLE IF NOT EXISTS event (
 
 CREATE INDEX IF NOT EXISTS event_article ON event(article_id, created_at);
 
+-- §8 Stage 1: features derived from an article's own text and raw capture.
+-- Nothing reads these yet, deliberately -- the score sorts, it never filters,
+-- and nothing has established that these signals are any good. Stage 5 decides
+-- that, once there are labels to check against.
+CREATE TABLE IF NOT EXISTS article_feature (
+  article_id  INTEGER NOT NULL REFERENCES article(id) ON DELETE CASCADE,
+  -- The extractor that produced this row. A changed definition writes a NEW
+  -- version rather than overwriting, because a score from one version and a
+  -- score from another are not comparable and the difference is invisible
+  -- once they share a column.
+  version     TEXT    NOT NULL,
+  score       REAL    NOT NULL DEFAULT 0,
+  -- One line saying why, stored beside the number. §8: an unexplained score
+  -- gets ignored within a week.
+  explain     TEXT    NOT NULL DEFAULT '',
+  payload     TEXT    NOT NULL DEFAULT '{}',   -- the individual signals, JSON
+  computed_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (article_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS article_feature_version ON article_feature(version, score DESC);
+
 CREATE TABLE IF NOT EXISTS setting (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
