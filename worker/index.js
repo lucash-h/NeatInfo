@@ -6,7 +6,8 @@ import { ftsQuery, buildArchiveQuery, buildArchiveCount, parseArchiveParams } fr
 const TOPIC_ID = 1;
 
 const LIST_COLUMNS = `id, url, title, source, author, published_at, summary, status,
-  favorite, notes, added_at, opened_at, listened_at, resolved_at, word_count, fetch_status`;
+  favorite, notes, added_at, opened_at, listened_at, resolved_at, word_count, fetch_status,
+  origin`;
 
 const json = (data, init = {}) =>
   new Response(JSON.stringify(data), {
@@ -108,15 +109,20 @@ async function getFeed(env, url) {
   const days = await lapseWindow(env);
   await applyLapses(env, days);
 
+  // Today is what *you* chose today. A poll that found forty things must not
+  // be able to flood the one page whose whole value is that it is short, so
+  // anything a machine added waits in Pending however recently it arrived --
+  // and Pending is exactly the complement, so nothing can fall between them.
+  // §7.7, §2.6
   const today = await env.DB.prepare(
     `SELECT ${LIST_COLUMNS} FROM article
-     WHERE topic_id = ?1 AND status = 'new' AND added_at >= ?2
+     WHERE topic_id = ?1 AND status = 'new' AND added_at >= ?2 AND origin = 'manual'
      ORDER BY added_at DESC`
   ).bind(TOPIC_ID, dayStart).all();
 
   const pending = await env.DB.prepare(
     `SELECT ${LIST_COLUMNS} FROM article
-     WHERE topic_id = ?1 AND status = 'new' AND added_at < ?2
+     WHERE topic_id = ?1 AND status = 'new' AND (added_at < ?2 OR origin = 'auto')
      ORDER BY added_at ASC`
   ).bind(TOPIC_ID, dayStart).all();
 
@@ -309,6 +315,15 @@ async function addArticle(env, request) {
     }
   }
 
+  // A poller says origin:'auto' (it waits in Pending, never Today) and
+  // defer:true (insert the row now, fetch the page later). Deferring is what
+  // keeps a scheduled run inside the free plan's 10ms CPU and 50-subrequest
+  // ceiling: discovering forty links costs one subrequest per *source*, not
+  // one per article, and extraction happens on the refetch path when you
+  // actually open something. §7.4
+  const origin = payload.origin === 'auto' ? 'auto' : 'manual';
+  const defer = Boolean(payload.defer);
+
   let record = {
     title: (payload.title || '').trim(),
     source: (payload.source || '').trim(),
@@ -323,7 +338,7 @@ async function addArticle(env, request) {
 
   let fetchError = null;
 
-  if (rawUrl && !pastedText) {
+  if (rawUrl && !pastedText && !defer) {
     const extracted = await extractArticle(normalized);
     if (extracted.ok) {
       record = {
@@ -366,13 +381,15 @@ async function addArticle(env, request) {
   const inserted = await env.DB.prepare(
     `INSERT INTO article
        (topic_id, url, url_normalized, title, source, author, published_at,
-        body_text, summary, raw_html_key, added_at, word_count, fetch_status, fetched_at)
-     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+        body_text, summary, raw_html_key, added_at, word_count, fetch_status, fetched_at,
+        origin)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
      RETURNING ${LIST_COLUMNS}`
   ).bind(
     TOPIC_ID, rawUrl || null, normalized, record.title, record.source, record.author,
     record.published_at, record.body_text, record.summary, record.raw_html_key,
-    ts, record.word_count, record.fetch_status, ts
+    ts, record.word_count, record.fetch_status, defer ? null : ts,
+    origin
   ).first();
 
   await env.DB.prepare(`INSERT INTO event (article_id, type, created_at) VALUES (?1, 'added', ?2)`)

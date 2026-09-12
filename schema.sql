@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS article (
 
   status         TEXT NOT NULL DEFAULT 'new'
                  CHECK (status IN ('new','kept','dismissed','lapsed')),
+
+  -- Who put it here. Today is what you chose today; anything a machine
+  -- found waits in Pending instead, however recently it arrived, so the
+  -- daily page cannot be flooded by a poll. §7.7
+  origin         TEXT NOT NULL DEFAULT 'manual'
+                 CHECK (origin IN ('manual','auto')),
   favorite       INTEGER NOT NULL DEFAULT 0,
   notes          TEXT,
 
@@ -46,6 +52,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS article_url_unique
   ON article(topic_id, url_normalized) WHERE url_normalized IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS article_surface ON article(topic_id, status, added_at);
+
+-- Today filters on origin as well as status and date, so the surface index
+-- gets it too; Pending is the complement and uses the same index.
+CREATE INDEX IF NOT EXISTS article_origin ON article(topic_id, status, origin, added_at);
 CREATE INDEX IF NOT EXISTS article_resolved ON article(topic_id, status, resolved_at);
 
 -- The archive filter bar filters and facets by source, so both the WHERE and

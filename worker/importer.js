@@ -16,7 +16,7 @@ const ARTICLE_COLUMNS = [
   'id', 'topic_id', 'url', 'url_normalized', 'title', 'source', 'author',
   'published_at', 'body_text', 'summary', 'raw_html_key', 'status',
   'favorite', 'notes', 'added_at', 'opened_at', 'listened_at', 'resolved_at',
-  'word_count', 'fetch_status', 'fetched_at'
+  'word_count', 'fetch_status', 'fetched_at', 'origin'
 ];
 
 const EVENT_COLUMNS = ['id', 'article_id', 'type', 'created_at'];

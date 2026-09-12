@@ -882,3 +882,15 @@ a:hover { color: var(--slate-link-hover); text-decoration: underline; }
 }
 
 .shortcut-row .kbd { flex: none; }
+
+/* -------------------------------------------------------------- V1-28 origin */
+
+/* "found for you" sits beside the meta line, not beside the lapse chip: it is
+   provenance, not urgency, and it must not compete with the thing that is
+   telling you an item is about to age out. */
+.chip.subtle {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--hairline);
+  margin-left: 8px;
+}

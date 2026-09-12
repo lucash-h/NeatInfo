@@ -9,7 +9,13 @@ export default function ArticleCard({ article, showLapse = false }) {
     <article className="card">
       {showLapse ? (
         <div className="card-head">
-          <span className="card-meta">{metaLine(article)}</span>
+          <span className="card-meta">
+            {metaLine(article)}
+            {/* §7.7 asks whether machine-added items should look different.
+                They should: an item you chose and an item a poll found are not
+                the same claim on your attention. */}
+            {article.origin === 'auto' && <span className="chip subtle">found for you</span>}
+          </span>
           {lapse && <span className={`chip${lapse.urgent ? ' urgent' : ''}`}>{lapse.label}</span>}
         </div>
       ) : (

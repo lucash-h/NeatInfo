@@ -135,7 +135,7 @@ export function pendingEmptyState({ filter, pendingTotal }) {
   if (!pendingTotal) {
     return {
       title: 'Pending is empty.',
-      note: 'Nothing is waiting on a decision. New articles land in Today first.',
+      note: 'Nothing is waiting on a decision. What you add yourself starts on Today; anything found for you waits here.',
     };
   }
   if (filter === 'opened') {

@@ -172,7 +172,7 @@ describe('pendingEmptyState', () => {
   it('says nothing is pending at all when the unfiltered total is zero', () => {
     expect(pendingEmptyState({ filter: 'all', pendingTotal: 0 })).toEqual({
       title: 'Pending is empty.',
-      note: 'Nothing is waiting on a decision. New articles land in Today first.',
+      note: 'Nothing is waiting on a decision. What you add yourself starts on Today; anything found for you waits here.',
     });
   });
 

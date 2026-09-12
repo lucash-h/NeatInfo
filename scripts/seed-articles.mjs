@@ -95,7 +95,10 @@ The passphrase is read from NEATINFO_PASSPHRASE, never from a flag.`);
       const res = await fetch(`${base}/api/articles`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', cookie },
-        body: JSON.stringify({ url: c.url })
+        // origin:'auto' lands it in Pending rather than Today. A 50-link
+        // pre-populate dumped onto Today would destroy the one property that
+        // page has -- that it is short enough to finish. §7.7
+        body: JSON.stringify({ url: c.url, origin: 'auto' })
       });
       const payload = await res.json().catch(() => ({}));
 
