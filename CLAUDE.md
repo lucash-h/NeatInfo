@@ -12,6 +12,7 @@ app/
 │   ├── extract.js    # HTMLRewriter extraction + HTML entity decoding
 │   ├── search.js     # FTS5 query sanitising + archive filter SQL
 │   ├── importer.js   # rebuilds a database from an export payload (pure)
+│   ├── speech.js     # Tier 2: segmenting + MeloTTS, generated on demand
 │   └── url.js        # URL normalization (UTM strip, arXiv dedup)
 ├── src/              # React 19 frontend (Vite 6)
 │   ├── App.jsx       # Shell, nav, keyboard shortcuts
@@ -21,7 +22,12 @@ app/
 │   └── components/   # Gate, Today, Pending, Archive, Discover,
 │                     # Reader, TtsPlayer, ArticleCard, ArchiveRow,
 │                     # AddSheet, SettingsSheet, Shortcuts, Toast
-├── discover/         # V2 discovery pipeline (runs in GitHub Actions, not Workers)
+├── pipeline/         # V2 scoring pipeline, Python (GitHub Actions, nightly)
+│                     #   NOT YET BUILT -- this is V1-33's target layout
+│   ├── features.py   # Stage 1 heuristics: counting over text + raw HTML
+│   ├── client.py     # pulls via /api/export, pushes features back
+│   └── requirements.txt
+├── discover/         # V2 discovery pipeline, JS (GitHub Actions, every 6h)
 │   ├── index.js      # Orchestrator: fetch → dedup → score → POST
 │   ├── rss.js        # RSS/Atom parser (zero deps)
 │   ├── hn.js         # HackerNews Algolia API
@@ -43,7 +49,8 @@ app/
 ├── vite.config.js    # React plugin, /api proxy to wrangler in dev
 └── .github/workflows/
     ├── deploy.yml    # CI: test → build → D1 migrate → wrangler deploy
-    └── discover.yml  # Cron every 6h: run discovery pipeline
+    ├── discover.yml  # Cron every 6h: run discovery pipeline
+    └── pipeline.yml   # Cron nightly: Stage 1 features (V1-33, not yet built)
 ```
 
 ## Architecture decisions
@@ -55,6 +62,7 @@ app/
 - **R2 budget cap.** Per-file 2MB, 8GB total. Usage is counted in a D1 `setting` row (`r2_usage_bytes`), not in an R2 object: the old counter was an R2 read-modify-write, so two concurrent adds lost one of the two counts and a deletion never subtracted. `/api/settings` re-measures the bucket authoritatively, since only a walk of it can see a deleted object.
 - **HTMLRewriter extraction.** No npm readability library — uses Cloudflare's native streaming parser. ~80% accuracy, good enough for a personal tool.
 - **Discovery pipeline runs in GitHub Actions**, not Workers. Full Node.js runtime, no execution time limits, free 2000 min/month.
+- **Two languages, one data contract.** The Worker and `discover/` are JavaScript; `pipeline/` and the Colab notebooks for training and evaluation are Python. They never import each other — `pipeline/` reads through `/api/export` and writes features back through the API. That boundary is deliberate: features are *stored*, never recomputed on the other side, so a feature definition cannot drift between the thing that scores and the thing that trains. Measured against the alternative, nothing here needs distributed compute: the whole corpus is ~176k tokens, and an 8B model reads it for ~1,000 neurons of a 10,000/day free allowance.
 
 ## Development
 
@@ -81,7 +89,7 @@ Tests run inside **workerd**, not Node, so HTMLRewriter, D1 and R2 behave as in 
 - **Worker secrets** (`PASSPHRASE`, `SESSION_SECRET`, `DISCOVER_KEY`) are set via `wrangler secret put`, never in code. Local dev uses `.dev.vars`.
 - **URL normalization** exists in two places: `worker/url.js` (Workers runtime) and `discover/url.js` (Node.js). Keep them in sync when changing dedup rules.
 - **Schema changes** go in `schema.sql` and use `CREATE IF NOT EXISTS` / `INSERT OR IGNORE` so the file is idempotent -- the deploy workflow re-runs it on every push. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a column added to an *existing* database cannot live there: it goes in `migrations/`, run by hand once per database, **before** the deploy that needs it.
-- **The discover script has no npm dependencies.** RSS parsing is regex-based. Keep it that way — it runs in GitHub Actions where install time matters.
+- **Dependencies are a per-component decision, not a project rule.** `discover/` is deliberately zero-dependency (RSS parsing is regex-based) because it runs every 6 hours and install time is in its hot path — worth preserving, but it is a property of that job, not of the repo. `pipeline/` is Python and has dependencies by design: it is where scoring, feature extraction and eventually NER live, and the ecosystem for that work is Python. Cached installs make the difference negligible for a nightly job.
 
 ## Deployment
 
@@ -100,7 +108,7 @@ The API token must have D1 Edit permission in addition to the standard Workers p
 
 ## Don't
 
-- Don't add npm dependencies to `discover/` — it intentionally has none.
+- Don't add npm dependencies to `discover/` — it is zero-dep on purpose and runs every 6 hours. (This does not apply to `pipeline/`, which is Python and has its own requirements.)
 - Don't store timezone info server-side — the client sends `dayStart` and that's the contract.
 - Don't put auto-discovered articles in Today — use `origin: 'auto'` so they land in Pending.
 - Don't read the `event` table to drive V1 behaviour — it's a write-ahead investment for V2 scoring. (`/api/export` copies it wholesale; that's a backup, not logic.)
