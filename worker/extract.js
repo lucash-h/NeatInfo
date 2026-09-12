@@ -6,6 +6,49 @@ import { isArxivAbs } from './url.js';
 const SKIP = new Set(['script', 'style', 'noscript', 'nav', 'header', 'footer', 'aside', 'form', 'svg']);
 const BLOCKS = 'article p, article li, main p, main li, [role="main"] p, [role="main"] li, body p, body li';
 
+// HTMLRewriter decodes entities inside text nodes but hands back attribute
+// values exactly as written, so everything taken from a <meta content="...">
+// arrived escaped: titles read `Ed Zitron&#39;s` and summaries read
+// `&quot;best software&quot;` while body text, collected through text handlers,
+// was always clean. That asymmetry is the whole bug. V1-30
+//
+// Only the entities that actually occur in page metadata are handled -- the
+// full HTML5 table is some two thousand names, and anything missed here is
+// left visible rather than mangled, which is the same outcome as before.
+const NAMED = { lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+export function decodeEntities(value) {
+  if (typeof value !== 'string' || !value.includes('&')) return value;
+
+  return value
+    // Numeric, decimal and hex. Anything outside the Unicode range, and the
+    // surrogate block, is left as written rather than throwing.
+    .replace(/&#(\d+);/g, (whole, digits) => {
+      const code = Number(digits);
+      return code > 0 && code <= 0x10ffff ? safeFromCode(code, whole) : whole;
+    })
+    .replace(/&#[xX]([0-9a-fA-F]+);/g, (whole, hex) => {
+      const code = parseInt(hex, 16);
+      return code > 0 && code <= 0x10ffff ? safeFromCode(code, whole) : whole;
+    })
+    .replace(/&(lt|gt|quot|apos|nbsp);/g, (whole, name) => NAMED[name] ?? whole)
+    // Ampersand LAST. Doing it first would turn `&amp;#39;` -- a correctly
+    // escaped literal "&#39;" -- into an apostrophe, inventing content the
+    // page never had.
+    .replace(/&amp;/g, '&');
+}
+
+function safeFromCode(code, whole) {
+  // Lone surrogates are not characters; String.fromCodePoint accepts them and
+  // produces text that breaks JSON encoding further down.
+  if (code >= 0xd800 && code <= 0xdfff) return whole;
+  try {
+    return String.fromCodePoint(code);
+  } catch {
+    return whole;
+  }
+}
+
 class Meta {
   constructor() {
     this.data = {};
@@ -26,7 +69,9 @@ class Meta {
       'article:published_time': 'published_at',
       'datepublished': 'published_at'
     }[prop];
-    if (keep && !this.data[keep]) this.data[keep] = content.trim();
+    // Decoded here, at the point of entry, so everything downstream --
+    // summarizeText, the body cap, the row itself -- sees real text. V1-30
+    if (keep && !this.data[keep]) this.data[keep] = decodeEntities(content).trim();
   }
 }
 
@@ -38,7 +83,7 @@ class Title {
   text(chunk) {
     this.buf += chunk.text;
     if (chunk.lastInTextNode && !this.target.data.title) {
-      this.target.data.title = this.buf.trim();
+      this.target.data.title = decodeEntities(this.buf).trim();
     }
   }
 }
@@ -54,7 +99,10 @@ class Body {
   element(el) {
     if (this.depth > 0) return;
     el.onEndTag(() => {
-      const text = this.current.replace(/\s+/g, ' ').trim();
+      // Decoded here rather than in text(): a chunk boundary can fall inside
+      // an entity ("&am" + "p;"), and by onEndTag the block is whole. The
+      // length floor is applied after decoding so it measures real characters.
+      const text = decodeEntities(this.current).replace(/\s+/g, ' ').trim();
       if (text.length > 40) this.parts.push(text);
       this.current = '';
     });
@@ -103,10 +151,12 @@ class ArxivMeta {
     const name = (el.getAttribute('name') || '').toLowerCase();
     const content = el.getAttribute('content');
     if (!content) return;
-    if (name === 'citation_title' && !this.title) this.title = content.trim();
-    else if (name === 'citation_author') this.authors.push(content.trim());
-    else if ((name === 'citation_date' || name === 'citation_online_date') && !this.date) this.date = content.trim();
-    else if (name === 'citation_abstract' && !this.abstract) this.abstract = content.trim();
+    // Same escaping applies to arXiv's citation_* tags. V1-30
+    const text = decodeEntities(content).trim();
+    if (name === 'citation_title' && !this.title) this.title = text;
+    else if (name === 'citation_author') this.authors.push(text);
+    else if ((name === 'citation_date' || name === 'citation_online_date') && !this.date) this.date = text;
+    else if (name === 'citation_abstract' && !this.abstract) this.abstract = text;
   }
 }
 
@@ -118,7 +168,7 @@ class Collect {
     this.buf += chunk.text;
   }
   get value() {
-    return this.buf.replace(/\s+/g, ' ').trim();
+    return decodeEntities(this.buf).replace(/\s+/g, ' ').trim();
   }
 }
 

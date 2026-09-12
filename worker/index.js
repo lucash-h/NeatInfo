@@ -485,6 +485,19 @@ async function updateArticle(env, id, request) {
     sets.push('source = ?');
     binds.push(body.source.trim().slice(0, 200));
   }
+
+  // D8 (V1-30). An explicit summary is the caller stating exactly what it
+  // wants -- a repair pass, or an edit -- and it overwrites. That is a
+  // different act from the derived summary below, which fills an empty field
+  // as a side effect of pasting text and must never overwrite something you
+  // have already read. Both behaviours are wanted; they are just not the same
+  // request.
+  const explicitSummary = typeof body.summary === 'string' ? body.summary.trim() : null;
+  if (explicitSummary !== null) {
+    sets.push('summary = ?');
+    binds.push(explicitSummary.slice(0, 2000));
+  }
+
   let bodyTruncated = false;
   if (typeof body.body_text === 'string' && body.body_text.trim()) {
     // Same cap as ingest: a paste out of a very long page must not 500. §5.2
@@ -495,8 +508,14 @@ async function updateArticle(env, id, request) {
     binds.push(text, countWords(text), nowIso());
     // A summary already on the card is not replaced behind the reader's back;
     // an empty one is filled from the pasted text. §3 "Show"
-    sets.push("summary = CASE WHEN summary IS NULL OR summary = '' THEN ? ELSE summary END");
-    binds.push(summarizeText(text));
+    //
+    // Skipped entirely when the caller named a summary: assigning the same
+    // column twice in one UPDATE is ambiguous at best, and the explicit value
+    // is the one that was asked for.
+    if (explicitSummary === null) {
+      sets.push("summary = CASE WHEN summary IS NULL OR summary = '' THEN ? ELSE summary END");
+      binds.push(summarizeText(text));
+    }
   }
 
   if (sets.length) {
