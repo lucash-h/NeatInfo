@@ -40,6 +40,8 @@ export function AppProvider({ children }) {
   const [initialLoading, setInitialLoading] = useState(true);
   const [loading, setLoading] = useState(false);
   const [openArticle, setOpenArticle] = useState(null);
+  const [candidates, setCandidates] = useState([]);
+  const [candidateBatchId, setCandidateBatchId] = useState(null);
   const [toastMsg, setToastMsg] = useState(null);
   const toastTimer = useRef();
 
@@ -239,6 +241,39 @@ export function AppProvider({ children }) {
     return result;
   }, 'Could not fetch that again.'), [guard, load, toast]);
 
+  const loadCandidates = useCallback(() => guard(async () => {
+    const data = await api('/api/candidates');
+    setCandidates(data.candidates || []);
+    setCandidateBatchId(data.batchId);
+    return data;
+  }, 'Could not load candidates.'), [guard]);
+
+  const keepCandidate = useCallback((id) => guard(async () => {
+    const result = await api(`/api/candidates/${id}/keep`, { method: 'POST' });
+    setCandidates(prev => prev.filter(c => c.id !== id));
+    toast(result.alreadyExists ? 'Already in your articles' : 'Kept — extracting article');
+    load({ background: true });
+    return result;
+  }, 'Could not keep that candidate.'), [guard, toast, load]);
+
+  const skipCandidate = useCallback((id) => guard(async () => {
+    await api(`/api/candidates/${id}/skip`, { method: 'POST' });
+    setCandidates(prev => prev.filter(c => c.id !== id));
+    toast('Skipped');
+  }, 'Could not skip that candidate.'), [guard, toast]);
+
+  const batchResolveCandidates = useCallback((actions) => guard(async () => {
+    await api('/api/candidates/batch', {
+      method: 'POST',
+      body: JSON.stringify({ actions }),
+    });
+    const keptIds = new Set(actions.filter(a => a.action === 'keep').map(a => a.id));
+    const skippedIds = new Set(actions.filter(a => a.action === 'skip').map(a => a.id));
+    setCandidates(prev => prev.filter(c => !keptIds.has(c.id) && !skippedIds.has(c.id)));
+    toast(`Kept ${keptIds.size}, skipped ${skippedIds.size}`);
+    if (keptIds.size) load({ background: true });
+  }, 'Could not resolve candidates.'), [guard, toast, load]);
+
   const close = useCallback(() => {
     // Closing the reader must silence it, however it was closed -- the Back
     // button, Escape, or switching surface. §6
@@ -265,10 +300,12 @@ export function AppProvider({ children }) {
   const value = {
     feed, surface, filter, query, openArticle, toastMsg,
     filters, facets, archiveRows, loadingMore, loading, initialLoading,
-    load, loadMore, loadFacets, setArchiveFilter, clearFilters, showTag,
+    candidates, candidateBatchId,
+    load, loadMore, loadFacets, loadCandidates, setArchiveFilter, clearFilters, showTag,
     switchSurface, setFilter, setQuery, open, close,
     resolve, toggleStar, saveNote, toast, step, currentList,
     fillArticle, refetch,
+    keepCandidate, skipCandidate, batchResolveCandidates,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

@@ -8,11 +8,12 @@ import Archive from './components/Archive';
 import Reader from './components/Reader';
 import AddSheet from './components/AddSheet';
 import SettingsSheet from './components/SettingsSheet';
+import Discover from './components/Discover';
 import Shortcuts from './components/Shortcuts';
 import Toast from './components/Toast';
 
 function Shell() {
-  const { feed, surface, switchSurface, load, openArticle, step, resolve, close, showTag, filters, archiveRows } = useApp();
+  const { feed, surface, switchSurface, load, openArticle, step, resolve, close, showTag, filters, archiveRows, candidates } = useApp();
   const [addOpen, setAddOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
@@ -115,6 +116,7 @@ function Shell() {
     pending: <Pending />,
     archive: <Archive />,
     starred: <Archive starredOnly />,
+    discover: <Discover />,
   }[surface] || <Today />;
 
   function NavBtn({ name, children }) {
@@ -146,6 +148,7 @@ function Shell() {
         <div className="rail-nav">
           <NavBtn name="today">Today <span className="count">{feed.today.length}</span></NavBtn>
           <NavBtn name="pending">Pending <span className="count">{feed.pendingTotal}</span></NavBtn>
+          <NavBtn name="discover">Discover {candidates.length > 0 && <span className="count badge">{candidates.length}</span>}</NavBtn>
           <NavBtn name="archive">Archive</NavBtn>
           <NavBtn name="starred">Starred</NavBtn>
         </div>
@@ -181,6 +184,7 @@ function Shell() {
         <div className="tabs">
           <TabBtn name="today">Today <span className="count">{feed.today.length}</span></TabBtn>
           <TabBtn name="pending">Pending <span className="count">{feed.pendingTotal}</span></TabBtn>
+          <TabBtn name="discover">Discover {candidates.length > 0 && <span className="count badge">{candidates.length}</span>}</TabBtn>
           <TabBtn name="archive">Archive</TabBtn>
         </div>
 
