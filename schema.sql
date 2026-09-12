@@ -28,6 +28,12 @@ CREATE TABLE IF NOT EXISTS article (
 
   status         TEXT NOT NULL DEFAULT 'new'
                  CHECK (status IN ('new','kept','dismissed','lapsed')),
+
+  -- Who put it here. Today is what you chose today; anything a machine
+  -- found waits in Pending instead, however recently it arrived, so the
+  -- daily page cannot be flooded by a poll. §7.7
+  origin         TEXT NOT NULL DEFAULT 'manual'
+                 CHECK (origin IN ('manual','auto')),
   favorite       INTEGER NOT NULL DEFAULT 0,
   notes          TEXT,
 
@@ -46,7 +52,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS article_url_unique
   ON article(topic_id, url_normalized) WHERE url_normalized IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS article_surface ON article(topic_id, status, added_at);
+
+-- Today filters on origin as well as status and date, so the surface index
+-- gets it too; Pending is the complement and uses the same index.
+CREATE INDEX IF NOT EXISTS article_origin ON article(topic_id, status, origin, added_at);
 CREATE INDEX IF NOT EXISTS article_resolved ON article(topic_id, status, resolved_at);
+
+-- The archive filter bar filters and facets by source, so both the WHERE and
+-- the GROUP BY behind /api/facets have an index to walk. §3 "Store"
+CREATE INDEX IF NOT EXISTS article_source ON article(topic_id, source);
+
+-- The date-range filter is on added_at across every status, which the
+-- status-prefixed indexes above cannot serve.
+CREATE INDEX IF NOT EXISTS article_added ON article(topic_id, added_at);
+
+-- Starred is a surface of its own and is a favorite=1 filter server-side, so
+-- the index is partial: it holds only the rows that surface can show.
+CREATE INDEX IF NOT EXISTS article_favorite ON article(topic_id, resolved_at) WHERE favorite = 1;
 
 CREATE TABLE IF NOT EXISTS tag (
   id   INTEGER PRIMARY KEY AUTOINCREMENT,

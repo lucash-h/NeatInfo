@@ -1,20 +1,43 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useApp } from '../AppContext';
-import { metaLine } from '../helpers';
+import { metaLine, needsText } from '../helpers';
 import TtsPlayer from './TtsPlayer';
-import { api } from '../api';
 
 export default function Reader() {
-  const { openArticle: a, close, resolve, toggleStar, saveNote } = useApp();
+  const { openArticle: a, close, resolve, toggleStar, saveNote, fillArticle, refetch } = useApp();
+  const [fillText, setFillText] = useState('');
+  const [busy, setBusy] = useState(false);
   const noteTimer = useRef();
-  const [noteValue, setNoteValue] = useState('');
+  const pendingNote = useRef(null);
+  const saveNoteRef = useRef(saveNote);
+  saveNoteRef.current = saveNote;
+  const [noteValue, setNoteValue] = useState(a?.notes || '');
+
+  // G8: the note used to be an uncontrolled `defaultValue`, so stepping j/l
+  // left the previous article's note on screen. It is keyed to the article
+  // now, and a debounced edit is flushed before the article changes under it.
+  useEffect(() => {
+    setNoteValue(a?.notes || '');
+    setFillText('');
+    return () => {
+      clearTimeout(noteTimer.current);
+      const queued = pendingNote.current;
+      pendingNote.current = null;
+      if (queued) saveNoteRef.current(queued.id, queued.value);
+    };
+  }, [a?.id]);
 
   const handleNoteChange = useCallback((e) => {
     const val = e.target.value;
+    const id = a.id;
     setNoteValue(val);
+    pendingNote.current = { id, value: val };
     clearTimeout(noteTimer.current);
-    noteTimer.current = setTimeout(() => saveNote(a.id, val), 800);
-  }, [a, saveNote]);
+    noteTimer.current = setTimeout(() => {
+      pendingNote.current = null;
+      saveNoteRef.current(id, val);
+    }, 800);
+  }, [a]);
 
   if (!a) {
     return (
@@ -59,7 +82,9 @@ export default function Reader() {
         <span className="eyebrow">
           {isNew ? (a.opened_at ? 'opened · undecided' : 'new') : a.status}
         </span>
-        <span className="keyhint">K keep · S star · X dismiss · J / L move</span>
+        {/* V1-22: full list lives in the `?` overlay; this strip only needs
+            enough to be a reminder, not a reference card. */}
+        <span className="keyhint">E keep · S star · X dismiss · <kbd className="kbd">?</kbd> for more</span>
       </div>
 
       <div className="reader-body">
@@ -79,16 +104,54 @@ export default function Reader() {
             paragraphs.map((p, i) => <p key={i} className="para">{p}</p>)
           ) : (
             <p className="card-summary">
-              {a.summary || 'No text was captured for this one. Open the original, or add it again by pasting the text.'}
+              {a.summary || 'No text was captured for this one.'}
             </p>
+          )}
+
+          {/* Never a dead end: an item whose fetch failed is completed here,
+              by retrying or by pasting the text. §3 "Pull" */}
+          {needsText(a) && (
+            <div className="fill-block">
+              <span className="eyebrow">This one has no text yet</span>
+              <p className="field-hint">
+                {a.fetch_status ? `The fetch came back "${a.fetch_status}".` : 'The page was never fetched.'}
+                {' '}Try again, or paste the text in and it fills in this same item — nothing is re-added.
+              </p>
+              {a.url && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy}
+                  onClick={async () => { setBusy(true); await refetch(a.id); setBusy(false); }}
+                >Try fetching again</button>
+              )}
+              <textarea
+                className="input textarea"
+                rows={5}
+                placeholder="Paste the article text"
+                value={fillText}
+                onChange={e => setFillText(e.target.value)}
+              />
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={busy || !fillText.trim()}
+                onClick={async () => {
+                  setBusy(true);
+                  await fillArticle(a.id, { body_text: fillText });
+                  setBusy(false);
+                }}
+              >Save the text</button>
+            </div>
           )}
 
           <div className="note-block">
             <span className="eyebrow">Note</span>
             <textarea
+              key={a.id}
               className="input textarea"
               placeholder="Why this mattered — searchable later"
-              defaultValue={a.notes || ''}
+              value={noteValue}
               onChange={handleNoteChange}
             />
           </div>
