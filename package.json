@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Collect, triage and archive articles. Cloudflare Workers + D1 + R2.",
   "scripts": {
     "dev:frontend": "vite",
