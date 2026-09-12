@@ -196,3 +196,55 @@ describe('the canary', () => {
     expect(body.pipelineLastCount).toBe(0);
   });
 });
+
+// The deduplication key is computed by the Worker, never taken from a caller.
+// That is what lets discover/ carry its own normalizer -- or be rewritten in
+// another language -- without any risk to the archive.
+describe('url_normalized is the Worker\'s to compute', () => {
+  const postCandidates = (candidates) =>
+    callJson('/api/candidates', { method: 'POST', headers: KEY, body: JSON.stringify({ candidates }) });
+
+  it('ignores a normalized key supplied by the client', async () => {
+    await postCandidates([{
+      url: 'https://example.com/a?utm_source=somewhere',
+      url_normalized: 'https://totally-wrong.example/nope',
+      title: 'A candidate'
+    }]);
+
+    const row = await env.DB.prepare(`SELECT url_normalized FROM candidate WHERE title = 'A candidate'`).first();
+    expect(row.url_normalized).toBe('https://example.com/a');
+  });
+
+  it('computes the same key for a candidate and a hand-pasted URL', async () => {
+    // The two paths into the archive must agree, or the unique index cannot
+    // see that they are the same article.
+    await postCandidates([{
+      url: 'https://example.com/same?utm_source=feed',
+      url_normalized: 'whatever-the-client-says',
+      title: 'From a feed'
+    }]);
+    const candidate = await env.DB.prepare(`SELECT url_normalized FROM candidate WHERE title = 'From a feed'`).first();
+
+    const { body } = await callJson('/api/articles', {
+      method: 'POST',
+      body: JSON.stringify({ url: 'https://example.com/same?ref=twitter', text: 'pasted text' })
+    });
+    const article = await env.DB.prepare(`SELECT url_normalized FROM article WHERE id = ?1`)
+      .bind(body.article.id).first();
+
+    expect(candidate.url_normalized).toBe(article.url_normalized);
+  });
+
+  it('keeps the raw url, so the key can always be rebuilt', async () => {
+    const raw = 'https://example.com/keepme?utm_source=x';
+    const { body } = await callJson('/api/articles', {
+      method: 'POST',
+      body: JSON.stringify({ url: raw, text: 'pasted text' })
+    });
+
+    const row = await env.DB.prepare(`SELECT url, url_normalized FROM article WHERE id = ?1`)
+      .bind(body.article.id).first();
+    expect(row.url).toBe(raw);
+    expect(row.url_normalized).toBe('https://example.com/keepme');
+  });
+});

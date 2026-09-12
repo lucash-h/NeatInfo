@@ -1024,7 +1024,14 @@ async function ingestCandidates(env, request) {
   const statements = [];
   for (const item of items.slice(0, 50)) {
     const url = (item.url || '').trim();
-    const normalized = item.url_normalized || url;
+    // Computed here, not taken from the request. url_normalized is the
+    // deduplication key -- the UNIQUE index on (topic_id, url_normalized) is
+    // the only thing that decides whether two links are the same article --
+    // and a key the server does not compute is a key the server cannot
+    // enforce. discover/ carries its own normalizer for deduping within a
+    // batch; that copy is advisory, and it may drift, be rewritten, or be
+    // written in another language without any risk to the archive.
+    const normalized = normalizeUrl(url) || url;
     // RSS is XML, so `&amp;` is mandatory there and `&#8217;` ubiquitous.
     // discover/ does no decoding by design -- it stays dependency-free -- so
     // this is where it has to happen, or the Discover screen renders raw
@@ -1085,16 +1092,21 @@ async function keepCandidate(env, id) {
   ).bind(id).first();
   if (!row) return fail(404, 'Candidate not found or already resolved.');
 
+  // Recomputed rather than inherited from the candidate row, for the same
+  // reason: this value becomes the article's deduplication key, and it should
+  // be produced by the same code that produces it for a hand-pasted URL.
+  const normalized = normalizeUrl(row.url) || row.url_normalized;
+
   const existing = await env.DB.prepare(
     `SELECT id FROM article WHERE topic_id = ?1 AND url_normalized = ?2`
-  ).bind(TOPIC_ID, row.url_normalized).first();
+  ).bind(TOPIC_ID, normalized).first();
 
   if (existing) {
     await env.DB.prepare(`UPDATE candidate SET status = 'kept' WHERE id = ?1`).bind(id).run();
     return json({ article: { id: existing.id }, alreadyExists: true });
   }
 
-  const extracted = await extractArticle(row.url_normalized);
+  const extracted = await extractArticle(normalized);
   const ts = nowIso();
 
   let record;
@@ -1103,7 +1115,7 @@ async function keepCandidate(env, id) {
   if (extracted.ok) {
     record = {
       title: extracted.title || row.title,
-      source: extracted.source || row.source || sourceFromUrl(row.url_normalized),
+      source: extracted.source || row.source || sourceFromUrl(normalized),
       author: extracted.author || row.author,
       published_at: extracted.published_at || row.published_at,
       summary: extracted.summary || row.summary,
@@ -1119,7 +1131,7 @@ async function keepCandidate(env, id) {
     fetchError = extracted.error;
     record = {
       title: row.title,
-      source: row.source || sourceFromUrl(row.url_normalized),
+      source: row.source || sourceFromUrl(normalized),
       author: row.author,
       published_at: row.published_at,
       summary: row.summary,
@@ -1137,7 +1149,7 @@ async function keepCandidate(env, id) {
      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'auto')
      RETURNING ${LIST_COLUMNS}`
   ).bind(
-    TOPIC_ID, row.url, row.url_normalized, record.title, record.source, record.author,
+    TOPIC_ID, row.url, normalized, record.title, record.source, record.author,
     record.published_at, record.body_text, record.summary, record.raw_html_key,
     ts, record.word_count, record.fetch_status, ts
   ).first();
