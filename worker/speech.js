@@ -54,9 +54,10 @@ export function segmentText(text) {
       continue;
     }
 
-    // A paragraph longer than a segment is split at sentence ends, and only
-    // at word boundaries if a single "sentence" is still too long (a URL, a
-    // run-on). Never mid-word: the synthesiser would pronounce the fragments.
+    // A paragraph longer than a segment is split at sentence ends, then at
+    // word boundaries if a single "sentence" is still too long (a URL, a
+    // run-on). A token longer than a whole segment -- a 900-character URL --
+    // is cut mid-token, because there is nowhere better to cut it.
     flush();
     for (const sentence of para.match(/[^.!?]+[.!?]*\s*/g) || [para]) {
       const s = sentence.trim();
@@ -90,13 +91,23 @@ export function speechText(article) {
   return title ? `${title}.\n\n${body}` : body;
 }
 
-// base64 -> bytes. atob is available on workerd; this is the only decoding
-// step, and it exists because the model returns text rather than audio.
+// base64 -> bytes, natively. The model returns text rather than audio, so this
+// runs on every segment: a 45-second segment is ~4 MB of WAV, which is a 5.3
+// million character base64 string.
+//
+// The obvious `atob` + charCodeAt loop is a four-million-iteration JS loop,
+// measured at ~14ms on a warm desktop core. The free plan allows **10ms of CPU
+// per invocation** and edge cores are slower, so that version would have
+// returned 1102 "exceeded CPU time limit" for every segment in production --
+// and could never fail locally, because `wrangler dev` does not enforce the
+// limit. Both paths below decode in C++ and are O(1) JS.
 export function decodeAudio(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+  if (typeof Uint8Array.fromBase64 === 'function') return Uint8Array.fromBase64(base64);
+  // Older runtimes: the data: URL decoder is also native. Async, so callers
+  // that hit this path await it -- generateSegment does.
+  return fetch(`data:application/octet-stream;base64,${base64}`)
+    .then((res) => res.arrayBuffer())
+    .then((buf) => new Uint8Array(buf));
 }
 
 // Returns the WAV bytes for one segment, or throws. The caller decides what a
@@ -108,12 +119,17 @@ export async function generateSegment(env, prompt) {
   // Documented as binary audio/mpeg, actually `{ audio: base64 }`. Both shapes
   // are handled because the documentation says one thing, the API does
   // another, and either could change.
+  // `await` covers both decodeAudio paths: native returns bytes, the data: URL
+  // fallback returns a promise.
   if (result && typeof result === 'object' && typeof result.audio === 'string') {
-    return decodeAudio(result.audio);
+    return { body: await decodeAudio(result.audio), contentType: 'audio/wav' };
   }
-  if (result instanceof ReadableStream) return result;
-  if (result instanceof ArrayBuffer) return new Uint8Array(result);
-  if (result instanceof Uint8Array) return result;
+  // The documented shape, which the model does not currently produce. It is
+  // documented as MPEG, so it is labelled as MPEG rather than mislabelled wav
+  // -- handling a shape you cannot label correctly is not handling it.
+  if (result instanceof ReadableStream) return { body: result, contentType: 'audio/mpeg' };
+  if (result instanceof ArrayBuffer) return { body: new Uint8Array(result), contentType: 'audio/mpeg' };
+  if (result instanceof Uint8Array) return { body: result, contentType: 'audio/mpeg' };
 
   throw new Error('Workers AI returned audio in an unrecognised shape.');
 }

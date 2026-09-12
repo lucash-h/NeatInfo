@@ -1,17 +1,24 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { api } from '../api';
 import { useApp } from '../AppContext';
-import { getPlayer, setEngine, webSpeechEngine, workersAudioEngine } from '../tts';
+import { getPlayer, setEngine, webSpeechEngine, workersAudioEngine, chooseEngine } from '../tts';
 
 // The UI knows only `speak / pause / resume / stop` and a progress fraction,
-// which is what lets §6's Tier 2 (R2 audio + Media Session) replace the engine
+// which is what lets §6's Tier 2 (server-generated audio + Media Session)
+// replace the engine
 // underneath without this file changing.
 export default function TtsPlayer({ article }) {
   const { toast } = useApp();
-  const [player, setPlayer] = useState(getPlayer);
+  // One player for the life of the app -- setEngine swaps the engine inside it
+  // rather than minting a new one, so this reference, getPlayer() in
+  // AppContext and the live player are always the same object.
+  const player = getPlayer();
   const [playing, setPlaying] = useState(false);
   const [voice, setVoice] = useState(null);   // 'server' | 'device', once known
   const fillRef = useRef();
+  // Guards against a double tap starting two generations: the second click
+  // sees status 'idle' too, and each one costs neurons.
+  const startingRef = useRef(false);
 
   const setProgress = useCallback((fraction) => {
     if (fillRef.current) fillRef.current.style.width = `${Math.round(fraction * 100)}%`;
@@ -41,40 +48,59 @@ export default function TtsPlayer({ article }) {
       return;
     }
 
-    // Server audio when the Worker can produce it, the browser's own voice when
-    // it cannot -- too long, no AI binding, or a generation failure. Tier 1
-    // stays as the floor deliberately: it works offline and needs no account,
-    // and losing that to a remote dependency would be a downgrade. §6
-    let active = player;
-    let usingServer = false;
+    // Server audio when the Worker can produce it, the browser's own voice
+    // when it cannot. Tier 1 stays as the floor on purpose: it works offline
+    // and needs no account, and losing speech entirely to a remote dependency
+    // would be a downgrade whatever the voice quality. §6
+    if (startingRef.current) return;
+    startingRef.current = true;
 
-    const server = workersAudioEngine({ articleId: article.id, fetchJson: api });
-    if (server.available) {
-      const units = await server.prepare(null, { articleId: article.id }).catch(() => null);
-      // The engine caches what prepare() fetched, so the player asking again
-      // when it starts speaking costs nothing.
-      if (units?.length) {
-        active = setEngine(server);
-        usingServer = true;
-      }
+    let chosen;
+    try {
+      chosen = await chooseEngine({
+        articleId: article.id,
+        fetchJson: api,
+        makeServerEngine: (opts) => workersAudioEngine(opts),
+        makeDeviceEngine: () => webSpeechEngine()
+      });
+    } finally {
+      startingRef.current = false;
     }
-    if (!usingServer) active = setEngine(webSpeechEngine());
 
-    setPlayer(active);
-    setVoice(usingServer ? 'server' : 'device');
+    const active = setEngine(chosen.engine);
+    setVoice(chosen.voice);
 
-    const started = await active.speak(`${article.title}. ${article.body_text || ''}`, {
+    const speakWith = (text) => active.speak(text, {
       onProgress: setProgress,
       onEnd: () => { setPlaying(false); setProgress(1); },
-      // Silence with the button reset and no explanation is the failure this
-      // whole task was about; the watchdog's message has to reach the reader.
-      // V1-31
       onError: (err) => {
         setPlaying(false);
         setProgress(0);
+        // A segment failing mid-article is the case the manifest cannot
+        // predict -- a 502, a stalled download, the day's limit reached
+        // between segments. Falling back here is what the spec promised and
+        // what stops a retry regenerating everything from segment zero.
+        if (chosen.voice === 'server') {
+          const device = webSpeechEngine();
+          if (device.available) {
+            setEngine(device);
+            setVoice('device');
+            toast('Server audio failed — switching to the device voice.');
+            setPlaying(true);
+            getPlayer().speak(text, {
+              onProgress: setProgress,
+              onEnd: () => { setPlaying(false); setProgress(1); },
+              onError: (e) => { setPlaying(false); if (e?.message) toast(e.message); }
+            });
+            return;
+          }
+        }
         if (err?.message) toast(err.message);
-      },
+      }
     });
+
+    const text = `${article.title}. ${article.body_text || ''}`;
+    const started = await speakWith(text);
     if (!started) return;
     setPlaying(true);
     api(`/api/articles/${article.id}/listen`, { method: 'POST' }).catch(() => {});

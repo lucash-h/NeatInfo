@@ -2,10 +2,14 @@
 // in without touching the UI."
 //
 // That interface is `speak / pause / resume / stop`, and everything the Web
-// Speech API knows lives behind `webSpeechEngine`. Tier 2 (server-side audio
-// in R2, played through an <audio> element with the Media Session API) is a
-// second engine object with the same four methods plus `available`, handed to
-// `setEngine()`. No component changes.
+// Speech API knows lives behind `webSpeechEngine`. Tier 2 is a second engine
+// object with the same methods plus `available`, handed to `setEngine()`.
+//
+// It generates audio on demand and stores none of it -- the original plan was
+// to cache it in R2, which measurement killed: melotts returns 44.1kHz WAV at
+// 88 KB a second, and §9.7 says not to hoard what is expensive and
+// reproducible. Comments elsewhere describing Tier 2 as "R2 audio" predate
+// that and are wrong; there is no bucket involved.
 
 // Chrome stops speaking after roughly fifteen seconds. Whether that limit is
 // per-utterance or across the whole speaking session is not settled here --
@@ -71,7 +75,8 @@ export function chunkText(text, max = CHUNK_CHARS) {
 // workaround.
 //
 // It lives in the engine rather than the player because it is a Web Speech
-// defect, and §6's Tier 2 (R2 audio through an <audio> element) must not
+// defect, and §6's Tier 2 (server-generated audio through an <audio> element)
+// must not
 // inherit a workaround for a bug it does not have.
 export const HEARTBEAT_MS = 10000;
 
@@ -183,10 +188,14 @@ function unitSize(unit) {
   return Number(unit?.chars) || 1;
 }
 
-export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) {
+export function createPlayer(initialEngine, { setTimeout: st, clearTimeout: ct } = {}) {
+  let engine = initialEngine;
   const startTimer = st || globalThis.setTimeout;
   const stopTimer = ct || globalThis.clearTimeout;
   let watchdog = null;
+  // Bumped by every stop(), so work started before a stop can tell that it is
+  // no longer wanted.
+  let generation = 0;
   let chunks = [];
   let index = 0;
   let spoken = 0;      // characters completed before the current chunk
@@ -252,7 +261,10 @@ export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) 
         // unless we are still meant to be playing.
         if (status !== 'playing') return;
         clearWatchdog();
-        spoken += unitSize(chunk) + 1;
+        // No +1: `total` is the plain sum of unit sizes now, not a joined
+        // string length, so a separator character per chunk made progress
+        // reach 100% about one chunk early on a long article.
+        spoken += unitSize(chunk);
         index += 1;
         speakNext();
       },
@@ -266,6 +278,7 @@ export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) 
 
   function stop() {
     clearWatchdog();
+    generation += 1;
     const wasSpeaking = status === 'playing' || status === 'paused';
     chunks = [];
     index = 0;
@@ -278,14 +291,33 @@ export function createPlayer(engine, { setTimeout: st, clearTimeout: ct } = {}) 
 
   return {
     get supported() { return engine.available; },
+    get engine() { return engine; },
     status: () => status,
     // Units are whatever the engine wants to be handed one at a time: strings
     // of text for the browser voice, `{index, chars}` descriptors for server
     // audio, where the text lives on the server and only the index travels.
     // The player never inspects them beyond their size. §6
+    // Swaps the engine without replacing the player. The previous version
+    // minted a new player per engine, which meant AppContext's
+    // getPlayer().stop(), the component's cached copy and the live player
+    // could be three different objects -- so a stop could land on one while
+    // another kept talking, and switching article mid-generation left the
+    // previous article reading aloud over the new one.
+    setEngine(next) {
+      if (next === engine) return this;
+      stop();
+      engine = next;
+      return this;
+    },
+
     async speak(text, opts = {}) {
       stop();
+      // Captured before the await. A stop() arriving during prepare() -- the
+      // reader closed, or stepped to another article -- must not be overtaken
+      // by the playback it was cancelling.
+      const epoch = generation;
       const next = engine.prepare ? await engine.prepare(text, opts) : chunkText(text);
+      if (epoch !== generation) return false;
       if (!next || !next.length) return false;
       handlers = opts;
       chunks = next;
@@ -326,60 +358,138 @@ export function getPlayer() {
 }
 
 // The Tier 2 swap point. §6
+//
+// Returns the same player it always has: one identity for the life of the app,
+// so getPlayer() anywhere and a reference held by a component are the same
+// object. Minting a new one here was how a stop could miss.
 export function setEngine(engine) {
-  if (player) player.stop();
-  player = createPlayer(engine);
-  return player;
+  return getPlayer().setEngine(engine);
 }
 
 // --------------------------------------------------------- Tier 2 engine
 
 // Server-generated speech. §6 / V1-32
 //
-// The Worker synthesises ~60 seconds at a time and stores none of it, so this
-// plays a sequence of short URLs through one <audio> element rather than one
-// long file. That element is what makes a locked iPhone keep playing, which is
-// the real reason this tier exists -- the voice being better is a bonus.
+// The Worker synthesises ~45 seconds at a time and stores none of it, so this
+// plays a sequence of short URLs. Three things about that are load-bearing on
+// iOS, which is the platform the tier exists for:
 //
-// `prepare` fetches the manifest, so the player learns the segment count from
-// the server instead of chunking text it would then have to send back.
+//   One element, reused. A freshly constructed <audio> calling play() from an
+//   `ended` handler has no user activation, and Safari rejects it. The element
+//   is created once and only its `src` changes.
+//
+//   Unlocked inside the click. `unlock()` is called synchronously from the tap
+//   that starts playback, before any await, because transient activation does
+//   not survive a network round trip.
+//
+//   Prefetched. Generating a segment takes 8-15 seconds, and with nothing
+//   playing in that gap iOS tears down the now-playing session and suspends
+//   the page -- so the chain would simply stop on a locked screen. Segment N+1
+//   is fetched into a blob while N plays.
 export function workersAudioEngine({
   articleId,
   fetchJson,
   makeAudio = () => new globalThis.Audio(),
+  fetchAudio = (url) => fetch(url),
   mediaSession = globalThis.navigator?.mediaSession
 } = {}) {
   let audio = null;
   let meta = null;
-  // The manifest is fetched once. The component asks for it to decide whether
-  // server audio is possible at all, and the player asks again when it starts
-  // speaking; those must not be two round trips, and must not disagree.
   let units = null;
+  let preparedId = null;
+  // At most one segment ahead: enough to hide the gap, not enough to generate
+  // audio for an article being abandoned.
+  let ahead = null;
+  let objectUrl = null;
 
-  const teardown = () => {
-    if (!audio) return;
-    audio.onended = null;
-    audio.onerror = null;
-    audio.pause();
-    // Dropping the src stops a segment still downloading; without it an
-    // abandoned article keeps pulling audio nobody will hear.
-    audio.removeAttribute('src');
-    audio.load?.();
-    audio = null;
+  // How long a stalled download is given to recover before it is called a
+  // failure. Long enough to ride out a lift or a tunnel, short enough that the
+  // reader is not left in silence wondering.
+  const STALL_RECOVERY_MS = 25000;
+  let stallTimer = null;
+
+  const clearStall = () => {
+    if (stallTimer === null) return;
+    globalThis.clearTimeout(stallTimer);
+    stallTimer = null;
+  };
+
+  const armStall = (report) => {
+    if (stallTimer !== null) return;
+    stallTimer = globalThis.setTimeout(() => {
+      stallTimer = null;
+      report(new Error('The audio stopped loading. Check your connection.'));
+    }, STALL_RECOVERY_MS);
+  };
+
+  const revoke = () => {
+    if (!objectUrl) return;
+    globalThis.URL?.revokeObjectURL?.(objectUrl);
+    objectUrl = null;
+  };
+
+  const setState = (state) => {
+    if (mediaSession) {
+      // iOS renders the lock-screen transport from playbackState rather than
+      // inferring it from the element, so without this the button shows the
+      // wrong symbol.
+      try { mediaSession.playbackState = state; } catch { /* older browsers */ }
+    }
+  };
+
+  const element = () => {
+    if (!audio) {
+      audio = makeAudio();
+      audio.preload = 'auto';
+    }
+    return audio;
+  };
+
+  const prefetch = (unit) => {
+    if (!unit || ahead?.index === unit.index) return;
+    // Every failure here is survivable: the segment is simply fetched normally
+    // when its turn comes. fetch() can also throw synchronously rather than
+    // rejecting, so the call itself is inside the try.
+    try {
+      ahead = {
+        index: unit.index,
+        blob: Promise.resolve(fetchAudio(unit.url))
+          .then((res) => (res?.ok ? res.blob() : null))
+          .catch(() => null)
+      };
+    } catch {
+      ahead = null;
+    }
   };
 
   return {
     available: typeof globalThis.Audio === 'function',
 
+    // Called synchronously from the click that starts playback. Playing a
+    // moment of silence is what marks the element as user-initiated, so every
+    // later src change may play without a gesture of its own.
+    unlock() {
+      const el = element();
+      try {
+        el.muted = true;
+        const started = el.play?.();
+        if (started?.then) started.then(() => { el.pause?.(); el.muted = false; }, () => { el.muted = false; });
+        else { el.pause?.(); el.muted = false; }
+      } catch {
+        el.muted = false;
+      }
+    },
+
     async prepare(text, opts = {}) {
-      if (units) return units;
       const id = opts.articleId ?? articleId;
       if (!id) return null;
+      if (units && preparedId === id) return units;
       const manifest = await fetchJson(`/api/articles/${id}/audio`);
-      // `available: false` is an answer, not a failure: too long, no text, or
-      // no AI binding. The caller falls back to the browser voice.
+      // `available: false` is an answer, not a failure: too long, no text, no
+      // AI binding, or the day's limit reached. The caller falls back.
       if (!manifest?.available || !manifest.segments) return null;
       meta = manifest;
+      preparedId = id;
       units = Array.from({ length: manifest.segments }, (_, index) => ({
         index,
         chars: manifest.segmentChars?.[index] ?? 1,
@@ -389,42 +499,123 @@ export function workersAudioEngine({
     },
 
     speak(unit, { onEnd, onError, onBoundary } = {}) {
-      teardown();
-      audio = makeAudio();
-      audio.preload = 'auto';
-      audio.src = unit.url;
+      const el = element();
+      revoke();
 
-      // Progress within a segment, reported in characters so it lines up with
-      // the player's text-based total.
-      audio.ontimeupdate = () => {
-        if (!audio?.duration || !Number.isFinite(audio.duration)) return;
-        onBoundary?.(Math.round((audio.currentTime / audio.duration) * unit.chars));
+      // A play() promise that is still pending when we pause or move on
+      // rejects with AbortError. That is us interrupting deliberately, not a
+      // failure, and routing it to onError would toast a DOM message and reset
+      // the reader's place.
+      const mine = unit.index;
+      const guard = (err) => {
+        if (err?.name === 'AbortError') return;
+        if (ahead?.index !== undefined && mine !== unit.index) return;
+        onError?.(err instanceof Error ? err : new Error('That part of the audio could not be played.'));
       };
-      audio.onended = () => onEnd?.();
-      audio.onerror = () => onError?.(new Error('That part of the audio could not be played.'));
+
+      const start = (src) => {
+        el.src = src;
+        el.ontimeupdate = () => {
+          if (!el.duration || !Number.isFinite(el.duration)) return;
+          onBoundary?.(Math.round((el.currentTime / el.duration) * unit.chars));
+          // Begin the next segment once this one is genuinely under way.
+          if (el.currentTime > 1 && units) prefetch(units[unit.index + 1]);
+        };
+        el.onended = () => { clearStall(); setState('paused'); onEnd?.(); };
+        el.onerror = () => guard(new Error('That part of the audio could not be played.'));
+        // A download that stalls fires neither `ended` nor `error`, so the
+        // player's watchdog -- derived from character count -- is minutes away.
+        // These are the element's own signals that the network, not the
+        // synthesiser, is the problem. Reporting a boundary here would be
+        // actively wrong: a boundary means progress and re-arms the watchdog.
+        el.onstalled = () => armStall(guard);
+        el.onwaiting = () => armStall(guard);
+        el.onplaying = clearStall;
+        el.oncanplay = clearStall;
+
+        const started = el.play?.();
+        if (started?.catch) started.catch(guard);
+        setState('playing');
+      };
 
       if (mediaSession && meta) {
-        // What the lock screen shows. Set per segment because some browsers
-        // clear it when the element's source changes.
         try {
           mediaSession.metadata = new globalThis.MediaMetadata({
             title: meta.title || 'NeatInfo',
             artist: meta.source || '',
             album: 'NeatInfo'
           });
-        } catch {
-          // MediaMetadata is missing on older browsers; audio still plays.
-        }
+        } catch { /* MediaMetadata missing; audio still plays */ }
       }
 
-      const started = audio.play?.();
-      // A rejected play() is usually an autoplay block, which is a real error
-      // the reader needs to see rather than silence.
-      if (started?.catch) started.catch((err) => onError?.(err));
+      // Use the prefetched blob when this is the segment we ran ahead on.
+      if (ahead?.index === unit.index) {
+        const pending = ahead.blob;
+        ahead = null;
+        pending.then((blob) => {
+          if (blob && globalThis.URL?.createObjectURL) {
+            objectUrl = globalThis.URL.createObjectURL(blob);
+            start(objectUrl);
+          } else {
+            start(unit.url);
+          }
+        }).catch(() => start(unit.url));
+        return;
+      }
+      start(unit.url);
     },
 
-    pause() { audio?.pause(); },
-    resume() { audio?.play?.()?.catch?.(() => {}); },
-    cancel() { teardown(); }
+    pause() { clearStall(); setState('paused'); audio?.pause(); },
+    resume() { setState('playing'); audio?.play?.()?.catch?.((err) => { if (err?.name !== 'AbortError') throw err; }); },
+    cancel() {
+      clearStall();
+      setState('none');
+      ahead = null;
+      revoke();
+      if (!audio) return;
+      audio.ontimeupdate = null;
+      audio.onended = null;
+      audio.onerror = null;
+      audio.onstalled = null;
+      audio.onwaiting = null;
+      audio.pause?.();
+      // Dropping the src stops a segment still downloading; without it an
+      // abandoned article keeps pulling audio nobody will hear, at 88 KB/s.
+      audio.removeAttribute?.('src');
+      audio.load?.();
+    }
   };
+}
+
+// ------------------------------------------------------- choosing a tier
+
+// Which voice an article gets. Extracted from the component deliberately: this
+// is the decision the whole tier turns on -- server audio when the Worker can
+// produce it, the browser's own voice when it cannot -- and inside a React
+// component with no jsdom in the project it could not be tested at all.
+//
+// Returns the engine to use and why, so the caller can label it honestly.
+export async function chooseEngine({ articleId, fetchJson, makeServerEngine, makeDeviceEngine }) {
+  const device = () => ({ engine: makeDeviceEngine(), voice: 'device' });
+
+  const server = makeServerEngine?.({ articleId, fetchJson });
+  if (!server?.available) return device();
+
+  // unlock() must happen inside the click that triggered this, before any
+  // await: Safari's transient activation does not survive a network round
+  // trip, and an element first played after one is rejected.
+  server.unlock?.();
+
+  let units = null;
+  try {
+    units = await server.prepare(null, { articleId });
+  } catch {
+    // A thrown prepare is the same answer as `available: false`.
+    units = null;
+  }
+  if (!units?.length) {
+    server.cancel?.();
+    return device();
+  }
+  return { engine: server, voice: 'server' };
 }

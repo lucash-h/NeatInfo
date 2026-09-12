@@ -77,7 +77,7 @@ Tests run inside **workerd**, not Node, so HTMLRewriter, D1 and R2 behave as in 
 
 ## Key conventions
 
-- **All API actions go through `AppContext.jsx`** — components never call `api()` directly. Every action is wrapped in `guard()` which handles 401 redirects and error toasts. *Known exception to fix:* `TtsPlayer.jsx` still calls `api()` directly for `/listen`.
+- **All API actions go through `AppContext.jsx`** — components never call `api()` directly. Every action is wrapped in `guard()` which handles 401 redirects and error toasts. *Known exception to fix:* `TtsPlayer.jsx` calls `api()` directly for `/listen`, and passes it into the speech engine as `fetchJson` for the audio manifest.
 - **Worker secrets** (`PASSPHRASE`, `SESSION_SECRET`, `DISCOVER_KEY`) are set via `wrangler secret put`, never in code. Local dev uses `.dev.vars`.
 - **URL normalization** exists in two places: `worker/url.js` (Workers runtime) and `discover/url.js` (Node.js). Keep them in sync when changing dedup rules.
 - **Schema changes** go in `schema.sql` and use `CREATE IF NOT EXISTS` / `INSERT OR IGNORE` so the file is idempotent -- the deploy workflow re-runs it on every push. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a column added to an *existing* database cannot live there: it goes in `migrations/`, run by hand once per database, **before** the deploy that needs it.

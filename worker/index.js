@@ -664,6 +664,47 @@ async function getRawHtml(env, id) {
 // one segment. Nothing is cached -- see worker/speech.js for why -- so this is
 // generated on the way to the reader and exists nowhere afterwards.
 
+// A day's ceiling on generation. MAX_SEGMENTS bounds one article; nothing
+// bounded a day, and the per-article figure is not what runs the allowance
+// down -- retrying a failed article from segment zero is. Free tier is 10,000
+// neurons/day and a segment is roughly 14, so 400 leaves comfortable room and
+// still covers far more listening than a day holds.
+//
+// Same shape as r2_usage_bytes: a `setting` row, incremented with one atomic
+// statement, because D1 is a single writer and a read-modify-write here would
+// lose counts exactly when the day is busiest. §5.2
+const AUDIO_DAY_LIMIT = 400;
+const AUDIO_DAY_KEY = 'audio_segments_day';
+const AUDIO_DAY_DATE = 'audio_segments_date';
+
+async function audioDayCount(env) {
+  const today = nowIso().slice(0, 10);
+  const rows = await env.DB.prepare(
+    `SELECT key, value FROM setting WHERE key IN (?1, ?2)`
+  ).bind(AUDIO_DAY_KEY, AUDIO_DAY_DATE).all();
+
+  const map = Object.fromEntries(rows.results.map((r) => [r.key, r.value]));
+  // A stale date means the count belongs to a day that is over.
+  if (map[AUDIO_DAY_DATE] !== today) return { used: 0, today };
+  const n = Number(map[AUDIO_DAY_KEY]);
+  return { used: Number.isFinite(n) && n > 0 ? n : 0, today };
+}
+
+async function bumpAudioDay(env, today) {
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(AUDIO_DAY_DATE, today),
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, '1')
+       ON CONFLICT(key) DO UPDATE SET value =
+         CAST(CASE WHEN (SELECT value FROM setting WHERE key = ?2) = ?3
+                   THEN CAST(setting.value AS INTEGER) + 1 ELSE 1 END AS TEXT)`
+    ).bind(AUDIO_DAY_KEY, AUDIO_DAY_DATE, today)
+  ]);
+}
+
 async function getAudioManifest(env, id) {
   const row = await env.DB.prepare(
     `SELECT title, source, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
@@ -686,6 +727,18 @@ async function getAudioManifest(env, id) {
     return json({
       available: false,
       reason: `Too long to read aloud (${segments.length} segments, limit ${MAX_SEGMENTS}).`,
+      segments: segments.length
+    });
+  }
+
+  const day = await audioDayCount(env);
+  if (day.used + segments.length > AUDIO_DAY_LIMIT) {
+    // Reported as unavailable rather than as an error: the client's answer to
+    // "no server audio" is already the browser voice, and this is the same
+    // answer for a different reason.
+    return json({
+      available: false,
+      reason: `Daily speech limit reached (${day.used} of ${AUDIO_DAY_LIMIT} segments). It resets at midnight UTC.`,
       segments: segments.length
     });
   }
@@ -719,8 +772,19 @@ async function getAudioSegment(env, id, index) {
     return fail(404, 'No such segment.');
   }
 
+  // Checked again here, not only in the manifest: the manifest is one snapshot
+  // taken before a long listen, and the segment route is what actually spends.
+  const day = await audioDayCount(env);
+  if (day.used >= AUDIO_DAY_LIMIT) {
+    return fail(429, `Daily speech limit reached (${AUDIO_DAY_LIMIT} segments). It resets at midnight UTC.`);
+  }
+
   let audio;
   try {
+    // Counted before generating rather than after: a request that dies partway
+    // has still spent the neurons, and an uncounted failure is the one that
+    // would let a retry loop run the allowance down.
+    await bumpAudioDay(env, day.today);
     audio = await generateSegment(env, segments[index]);
   } catch (err) {
     // The reader falls back to the browser voice on this, so it must be a
@@ -728,9 +792,9 @@ async function getAudioSegment(env, id, index) {
     return fail(502, `Speech generation failed: ${String(err?.message || err)}`);
   }
 
-  return new Response(audio, {
+  return new Response(audio.body, {
     headers: {
-      'content-type': 'audio/wav',
+      'content-type': audio.contentType,
       // Private and brief. The audio is deterministic for a given text, but
       // storing it is the thing this design exists to avoid, and a long cache
       // here would just move the hoard into the browser.

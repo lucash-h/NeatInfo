@@ -1,8 +1,8 @@
 // §6: Tier 1 behind a `speak / pause / stop` interface. The tests drive a fake
-// engine, which is the same seam Tier 2 (R2 audio + Media Session) will use --
+// engine, which is the same seam Tier 2 (server-generated audio) uses --
 // if this file can swap the engine, so can §6's upgrade.
-import { describe, expect, it } from 'vitest';
-import { chunkText, createPlayer, webSpeechEngine, workersAudioEngine, stallTimeout, CHUNK_CHARS, HEARTBEAT_MS } from '../src/tts.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { chunkText, createPlayer, webSpeechEngine, workersAudioEngine, chooseEngine, stallTimeout, CHUNK_CHARS, HEARTBEAT_MS } from '../src/tts.js';
 
 // Stands in for speechSynthesis: nothing happens until the test says an
 // utterance finished, which is how a real browser behaves.
@@ -485,6 +485,8 @@ describe('the server audio engine', () => {
       articleId: 7,
       fetchJson: json,
       makeAudio: () => audio,
+      // Prefetch would otherwise reach workerd's fetch with a relative URL.
+      fetchAudio: async () => ({ ok: false }),
       mediaSession: null
     });
     return { engine, audio };
@@ -594,5 +596,215 @@ describe('the server audio engine', () => {
     const player = createPlayer(engine);
 
     expect(await player.speak('some text', { articleId: 7 })).toBe(false);
+  });
+});
+
+// V1-32 review follow-ups. These cover the paths that were invisible before:
+// engine selection (which lived inside a React component, and there is no
+// jsdom in this project), and the <audio> behaviours the first fake did not
+// model -- a play() that rejects, and a duration that is NaN until metadata
+// loads.
+describe('chooseEngine', () => {
+  // workerd has no Audio constructor, and the server engine reports
+  // `available` from it. The tests are about the choice, not the environment.
+  beforeAll(() => { globalThis.Audio = class { constructor() {} }; });
+  afterAll(() => { delete globalThis.Audio; });
+
+  const deviceEngine = () => ({ available: true, kind: 'device' });
+  const serverFrom = (fetchJson) => workersAudioEngine({
+    articleId: 7,
+    fetchJson,
+    makeAudio: () => ({ play: () => Promise.resolve(), pause() {}, load() {}, removeAttribute() {} }),
+    fetchAudio: async () => ({ ok: false }),
+    mediaSession: null
+  });
+
+  it('uses server audio when the manifest offers segments', async () => {
+    const chosen = await chooseEngine({
+      articleId: 7,
+      fetchJson: async () => ({ available: true, segments: 2, segmentChars: [10, 10] }),
+      makeServerEngine: ({ fetchJson }) => serverFrom(fetchJson),
+      makeDeviceEngine: deviceEngine
+    });
+    expect(chosen.voice).toBe('server');
+  });
+
+  it('falls back to the device voice when the server declines', async () => {
+    const chosen = await chooseEngine({
+      articleId: 7,
+      fetchJson: async () => ({ available: false, reason: 'Daily speech limit reached', segments: 0 }),
+      makeServerEngine: ({ fetchJson }) => serverFrom(fetchJson),
+      makeDeviceEngine: deviceEngine
+    });
+    expect(chosen.voice).toBe('device');
+    expect(chosen.engine.kind).toBe('device');
+  });
+
+  it('falls back when prepare throws rather than returning null', async () => {
+    const chosen = await chooseEngine({
+      articleId: 7,
+      fetchJson: async () => { throw new Error('network down'); },
+      makeServerEngine: ({ fetchJson }) => serverFrom(fetchJson),
+      makeDeviceEngine: deviceEngine
+    });
+    expect(chosen.voice).toBe('device');
+  });
+
+  it('unlocks the element before awaiting anything, or iOS rejects playback', async () => {
+    // Transient activation does not survive a network round trip, so unlock()
+    // has to happen synchronously inside the click that started this.
+    const order = [];
+    const server = {
+      available: true,
+      unlock: () => order.push('unlock'),
+      prepare: async () => { order.push('prepare'); return [{ index: 0, chars: 1, url: '/x' }]; }
+    };
+    await chooseEngine({
+      articleId: 7,
+      fetchJson: async () => ({}),
+      makeServerEngine: () => server,
+      makeDeviceEngine: deviceEngine
+    });
+    expect(order).toEqual(['unlock', 'prepare']);
+  });
+
+  it('uses the device voice when the browser has no Audio at all', async () => {
+    const chosen = await chooseEngine({
+      articleId: 7,
+      fetchJson: async () => ({ available: true, segments: 1, segmentChars: [10] }),
+      makeServerEngine: () => ({ available: false }),
+      makeDeviceEngine: deviceEngine
+    });
+    expect(chosen.voice).toBe('device');
+  });
+});
+
+describe('the server engine against a less forgiving fake element', () => {
+  function realisticAudio({ playResult } = {}) {
+    return {
+      src: null, preload: null, currentTime: 0,
+      duration: NaN,            // real elements report NaN until loadedmetadata
+      muted: false, plays: 0, pauses: 0,
+      play() { this.plays += 1; return playResult ? playResult() : Promise.resolve(); },
+      pause() { this.pauses += 1; },
+      load() {}, removeAttribute() { this.src = null; }
+    };
+  }
+
+  const manifest = { available: true, segments: 1, segmentChars: [800], title: 'T', source: 's' };
+
+  it('reports no progress while duration is NaN, rather than NaN%', async () => {
+    // Remove the isFinite guard and this yields width:"NaN%" on the bar.
+    const audio = realisticAudio();
+    const engine = workersAudioEngine({
+      articleId: 7, fetchJson: async () => manifest,
+      makeAudio: () => audio, mediaSession: null
+    });
+    const units = await engine.prepare(null, { articleId: 7 });
+    const seen = [];
+    engine.speak(units[0], { onBoundary: (n) => seen.push(n) });
+
+    audio.currentTime = 3;
+    audio.ontimeupdate();
+    expect(seen).toEqual([]);
+
+    audio.duration = 10;
+    audio.ontimeupdate();
+    expect(seen).toEqual([240]);
+  });
+
+  it('does not report a deliberate interruption as an error', async () => {
+    // Pausing during the 8-15s generation rejects the pending play() promise
+    // with AbortError. Surfacing it toasted a raw DOM message and reset the
+    // reader's place to zero.
+    const audio = realisticAudio({
+      playResult: () => Promise.reject(Object.assign(new Error('interrupted'), { name: 'AbortError' }))
+    });
+    const engine = workersAudioEngine({
+      articleId: 7, fetchJson: async () => manifest,
+      makeAudio: () => audio, mediaSession: null
+    });
+    const units = await engine.prepare(null, { articleId: 7 });
+    let failure = null;
+    engine.speak(units[0], { onError: (e) => { failure = e; } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(failure).toBe(null);
+  });
+
+  it('does report a genuine play failure, such as an autoplay block', async () => {
+    const audio = realisticAudio({
+      playResult: () => Promise.reject(Object.assign(new Error('blocked'), { name: 'NotAllowedError' }))
+    });
+    const engine = workersAudioEngine({
+      articleId: 7, fetchJson: async () => manifest,
+      makeAudio: () => audio, mediaSession: null
+    });
+    const units = await engine.prepare(null, { articleId: 7 });
+    let failure = null;
+    engine.speak(units[0], { onError: (e) => { failure = e; } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(failure).toBeInstanceOf(Error);
+  });
+
+  it('reuses one element across segments, which is what iOS requires', async () => {
+    // A freshly constructed element calling play() from an `ended` handler has
+    // no user activation, and Safari rejects it.
+    let built = 0;
+    const audio = realisticAudio();
+    const engine = workersAudioEngine({
+      articleId: 7,
+      fetchJson: async () => ({ available: true, segments: 3, segmentChars: [10, 10, 10] }),
+      makeAudio: () => { built += 1; return audio; },
+      fetchAudio: async () => ({ ok: false }),
+      mediaSession: null
+    });
+    const units = await engine.prepare(null, { articleId: 7 });
+
+    engine.speak(units[0], {});
+    engine.speak(units[1], {});
+    engine.speak(units[2], {});
+
+    expect(built).toBe(1);
+  });
+
+  it('sets Media Session playback state, which iOS renders the transport from', async () => {
+    const session = { metadata: null, playbackState: 'none' };
+    globalThis.MediaMetadata = class { constructor(init) { Object.assign(this, init); } };
+    const audio = realisticAudio();
+    const engine = workersAudioEngine({
+      articleId: 7, fetchJson: async () => manifest,
+      makeAudio: () => audio, mediaSession: session
+    });
+    const units = await engine.prepare(null, { articleId: 7 });
+
+    engine.speak(units[0], {});
+    expect(session.playbackState).toBe('playing');
+    expect(session.metadata.title).toBe('T');
+
+    engine.pause();
+    expect(session.playbackState).toBe('paused');
+
+    engine.cancel();
+    expect(session.playbackState).toBe('none');
+  });
+
+  it('asks the server once per article, however often it is prepared', async () => {
+    let calls = 0;
+    const engine = workersAudioEngine({
+      articleId: 7,
+      fetchJson: async () => { calls += 1; return manifest; },
+      makeAudio: () => realisticAudio(), mediaSession: null
+    });
+    await engine.prepare(null, { articleId: 7 });
+    await engine.prepare(null, { articleId: 7 });
+    expect(calls).toBe(1);
+
+    // A different article is a different question, and must not reuse the memo.
+    await engine.prepare(null, { articleId: 8 });
+    expect(calls).toBe(2);
   });
 });
