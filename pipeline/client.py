@@ -30,6 +30,39 @@ import urllib.request
 
 from features import VERSION, feature_row
 
+
+def load_dotenv(path: str) -> dict[str, str]:
+    """Read app/.env, the way scripts/seed-articles.mjs does.
+
+    In Actions the values come from repo secrets and this finds nothing, which
+    is correct -- .env is gitignored and never reaches a runner. Locally it
+    means the key is typed once into a file rather than onto a command line,
+    where it would land in shell history and in the process list.
+    """
+    out: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key.strip()] = value
+    return out
+
+# Cloudflare's edge rejects urllib's default "Python-urllib/3.x" with a 403
+# and error 1010 -- a browser-signature block, before the request ever reaches
+# the Worker. Found by running this against production rather than localhost,
+# which is the only place it happens. scripts/gather-candidates.mjs sets a UA
+# for the same reason.
+USER_AGENT = "NeatInfo-pipeline/1.0 (personal reading tracker; single user)"
+
 BATCH = 25
 # Raw HTML is fetched per article and is the slow part; be polite to our own
 # Worker rather than opening fifty sockets at once.
@@ -44,6 +77,8 @@ def request(url: str, key: str, method: str = "GET", body: dict | None = None, a
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("x-discover-key", key)
+    req.add_header("user-agent", USER_AGENT)
+    req.add_header("accept", "application/json, */*")
     if data:
         req.add_header("content-type", "application/json")
     try:
@@ -131,10 +166,19 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="stop after this many articles")
     args = parser.parse_args()
 
-    key = os.environ.get("NEATINFO_DISCOVER_KEY", "")
+    # Environment first, so a one-off run against another instance needs no
+    # edit; then app/.env for everyday local use.
+    env_file = load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+    key = os.environ.get("NEATINFO_DISCOVER_KEY") or env_file.get("NEATINFO_DISCOVER_KEY") or env_file.get("DISCOVER_KEY", "")
     if not key:
-        print("NEATINFO_DISCOVER_KEY is not set.", file=sys.stderr)
+        print(
+            "No pipeline key. Set NEATINFO_DISCOVER_KEY, or put it in app/.env.",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
+
+    if args.base == parser.get_default("base"):
+        args.base = env_file.get("NEATINFO_BASE") or args.base
 
     started = time.time()
     try:
