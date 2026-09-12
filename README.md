@@ -3,9 +3,10 @@
 Implementation of `NeatInfo.dc.html` (Claude Design) against the v1 scope in
 `../NeatInfo_Design_Report.md`: **pull, show, deal with, store.**
 
-A single-user reading tracker with three surfaces — **Today** (added today),
-**Pending** (older, undecided, oldest first), and **Archive** (kept,
-dismissed, or lapsed — terminal, searchable forever, nothing ever deleted).
+A single-user reading tracker with three surfaces — **Today** (added today, by
+you), **Pending** (everything else still undecided — older items, and anything
+a machine found — oldest first), and **Archive** (kept, dismissed, or lapsed —
+terminal, searchable forever, nothing ever deleted).
 Anything left in Pending past the lapse window (default 14 days) is
 auto-resolved to `lapsed` so the queue can never become a guilt pile. One
 Cloudflare Worker serves both the API and the built frontend; D1 holds the
@@ -15,6 +16,8 @@ queryable data, R2 holds raw HTML.
 app/
   wrangler.toml           bindings + secrets checklist
   schema.sql              D1 schema, FTS5 index, seed topic
+  migrations/             one-off ALTERs for databases that already exist
+  .env.example            copy to .env for the seeding scripts (gitignored)
   seed.sql                sample rows for local dev only
   vite.config.js          dev server + proxy to wrangler dev
   vitest.config.js        tests run inside workerd via @cloudflare/vitest-pool-workers
@@ -25,6 +28,7 @@ app/
     auth.js                single passphrase, HMAC-signed cookie
     url.js                 URL normalization for duplicate detection
     search.js               FTS5 query building + archive filters
+    importer.js             rebuilds a database from an export payload
   src/
     main.jsx               React entry point
     App.jsx                shell: surface switching, keyboard shortcuts, share-target
@@ -46,7 +50,10 @@ app/
     icon.svg, icon-maskable.svg    PWA icons
     manifest.webmanifest            PWA manifest + share-target
     sw.js                           offline shell only, never caches /api
-  scripts/
+  scripts/                see scripts/README.md
+    gather-candidates.mjs   collects candidates from TLDR AI, Hacker News, HF papers
+    seed-articles.mjs       adds a candidate list through the app's own API
+    import.mjs              turns an export payload back into SQL
     validate-capture.mjs    §5.4 script: checks raw captures are chunkable for v2
   test/                     the suite, run inside workerd (see "Running the tests")
   .github/workflows/deploy.yml   test -> build -> migrate -> deploy, on push to main
@@ -102,6 +109,49 @@ between tests, so **all tests share one D1 file** — `resetDb()` in
 `test/helpers.js` is what makes each test independent; every stateful test
 file calls it in `beforeEach`.
 
+## Populating the board
+
+Ingestion in v1 is you pasting links in — automation is §7 and deliberately not
+built. The risk that creates is named in §9.1: Today is empty every day until
+you feed it, and the app dies of an empty page rather than of a bug.
+
+`scripts/` holds the bootstrap for that — `gather-candidates.mjs` collects
+candidates from TLDR AI, Hacker News and Hugging Face daily papers, and
+`seed-articles.mjs` adds them through the app's own API:
+
+```bash
+cp .env.example .env        # then put the passphrase in it
+node scripts/gather-candidates.mjs --out candidates.json
+node scripts/seed-articles.mjs --file candidates.json --limit 5
+```
+
+Seeded items arrive with `origin: 'auto'`, so they wait in Pending rather than
+flooding Today, and are tagged with the source they came from. See
+[`scripts/README.md`](scripts/README.md) for the sources, the options, and why
+this is a bootstrap rather than the pipeline.
+
+## Migrations
+
+`schema.sql` is idempotent and the deploy workflow re-runs it on every push, so
+it describes a database created from scratch. SQLite has no
+`ADD COLUMN IF NOT EXISTS`, which means a column added to an existing database
+cannot live there — an unguarded `ALTER` would fail every deploy after the
+first.
+
+So `migrations/` holds those, run by hand, once per database:
+
+```bash
+npx wrangler d1 execute neatinfo --local  --file=./migrations/0001-article-origin.sql
+npx wrangler d1 execute neatinfo --remote --file=./migrations/0001-article-origin.sql
+```
+
+Running one twice is an error ("duplicate column name"), which is the correct
+and harmless outcome — it means the database already has it.
+
+**Apply a migration before the deploy that needs it**, not after: the new code
+selects the new column from the moment it ships, while the currently-deployed
+code is unaffected by a column it does not know about.
+
 ## Deploying
 
 `.github/workflows/deploy.yml` runs on every push to `main`:
@@ -142,7 +192,7 @@ All routes except `/api/session` require the session cookie (`POST
 | `DELETE` | `/api/session` | clears the cookie |
 | `GET` | `/api/feed?dayStart&filter&q&status&favorite&source&tag&from&to&limit&offset` | Today, Pending and a page of Archive in one read |
 | `GET` | `/api/facets` | sources/tags/earliest-date for the archive filter bar |
-| `POST` | `/api/articles` | `{url}` or `{text,title,source}`; 409 on duplicate |
+| `POST` | `/api/articles` | `{url}` or `{text,title,source}`; 409 on duplicate. Also `origin: 'auto'` (waits in Pending, never Today) and `defer: true` (insert the row without fetching the page) |
 | `GET` | `/api/articles/:id` | full record, including `body_text` |
 | `PATCH` | `/api/articles/:id` | `{notes, title, source, body_text, tags}` |
 | `POST` | `/api/articles/:id/open` | sets `opened_at` |
@@ -157,9 +207,18 @@ All routes except `/api/session` require the session cookie (`POST
 ## The decisions this code makes
 
 **Surfaces are queries, not jobs.** Today, Pending and Archive are computed at
-read time from `status` and `added_at`. The browser sends its own local midnight
-as `dayStart`, so the boundary is correct in any timezone and there is no
-scheduled worker to fail overnight. (§2.6)
+read time from `status`, `added_at` and `origin`. The browser sends its own local
+midnight as `dayStart`, so the boundary is correct in any timezone and there is
+no scheduled worker to fail overnight. (§2.6)
+
+**Today is what you chose; Pending is everything else.** `origin` is `manual` or
+`auto`, and Today shows only `manual` items added today. A poll that finds forty
+links must not be able to flood the one page whose entire value is that it is
+short enough to finish, so machine-found items wait in Pending however recently
+they arrived — and Pending is the exact complement, so nothing can fall between
+the two. Backdating `added_at` would have moved them for free and was rejected:
+lapse counts from `added_at`, and that column plus the event stream are the one
+record v2 cannot reconstruct. (§7.7)
 
 **Lapse is a recorded transition, written lazily.** §2.6 wants no cron and §9.4
 wants a real event to train on later. Both: `applyLapses()` runs on every feed
