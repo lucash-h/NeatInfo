@@ -1,7 +1,8 @@
 import { isAuthed, issueCookie, clearCookie, checkPassphrase } from './auth.js';
-import { extractArticle, summarizeText, countWords, truncateBodyText } from './extract.js';
+import { extractArticle, summarizeText, countWords, truncateBodyText, decodeEntities } from './extract.js';
 import { normalizeUrl, sourceFromUrl } from './url.js';
 import { ftsQuery, buildArchiveQuery, buildArchiveCount, parseArchiveParams } from './search.js';
+import { segmentText, speechText, generateSegment, MAX_SEGMENTS } from './speech.js';
 
 const TOPIC_ID = 1;
 
@@ -324,9 +325,15 @@ async function addArticle(env, request) {
   const origin = payload.origin === 'auto' ? 'auto' : 'manual';
   const defer = Boolean(payload.defer);
 
+  // Decoded at the boundary, for the same reason Meta.element decodes: this is
+  // where untrusted text enters. It matters more here than it looks -- RSS is
+  // XML, so `&amp;` is mandatory and `&#8217;` ubiquitous, and discover/ has no
+  // decoding of its own by design (it must stay dependency-free). A caller's
+  // title also *outranks* the extractor's below, so an undecoded one would win
+  // over the clean one extraction just produced. V1-30
   let record = {
-    title: (payload.title || '').trim(),
-    source: (payload.source || '').trim(),
+    title: decodeEntities((payload.title || '').trim()),
+    source: decodeEntities((payload.source || '').trim()),
     author: null,
     published_at: null,
     summary: '',
@@ -485,18 +492,58 @@ async function updateArticle(env, id, request) {
     sets.push('source = ?');
     binds.push(body.source.trim().slice(0, 200));
   }
+  // Author had no route in at all, which left refetch as the only way to
+  // repair one -- and refetch cannot reach a page that now 403s. V1-30
+  if (typeof body.author === 'string' && body.author.trim()) {
+    sets.push('author = ?');
+    binds.push(body.author.trim().slice(0, 300));
+  }
+
+  // D8 (V1-30). An explicit summary is the caller stating exactly what it
+  // wants -- a repair pass, or an edit -- and it overwrites. That is a
+  // different act from the derived summary below, which fills an empty field
+  // as a side effect of pasting text and must never overwrite something you
+  // have already read. Both behaviours are wanted; they are just not the same
+  // request.
+  // Empty is ignored, matching title and source. Blanking a summary is not
+  // something any current caller wants, and an edit form PATCHing {title,
+  // summary} with the box left empty would otherwise destroy it silently.
+  const explicitSummary =
+    typeof body.summary === 'string' && body.summary.trim() ? body.summary.trim() : null;
+  if (explicitSummary !== null) {
+    sets.push('summary = ?');
+    binds.push(explicitSummary.slice(0, 2000));
+  }
+
   let bodyTruncated = false;
   if (typeof body.body_text === 'string' && body.body_text.trim()) {
     // Same cap as ingest: a paste out of a very long page must not 500. §5.2
     const capped = truncateBodyText(body.body_text.trim());
     const text = capped.text;
     bodyTruncated = capped.truncated;
-    sets.push('body_text = ?', 'word_count = ?', "fetch_status = 'pasted'", 'fetched_at = ?');
-    binds.push(text, countWords(text), nowIso());
+    // `keep_fetch_status` is for a repair: decoding entities in stored text is
+    // a pure local transform, and relabelling two dozen fetched articles as
+    // hand-pasted would destroy the one signal that says where text came from.
+    // Explicit rather than inferred -- a clever "is this the same text modulo
+    // decoding?" check is how you end up with another comment that is
+    // confidently wrong about what the code does. V1-30
+    if (body.keep_fetch_status === true) {
+      sets.push('body_text = ?', 'word_count = ?');
+      binds.push(text, countWords(text));
+    } else {
+      sets.push('body_text = ?', 'word_count = ?', "fetch_status = 'pasted'", 'fetched_at = ?');
+      binds.push(text, countWords(text), nowIso());
+    }
     // A summary already on the card is not replaced behind the reader's back;
     // an empty one is filled from the pasted text. §3 "Show"
-    sets.push("summary = CASE WHEN summary IS NULL OR summary = '' THEN ? ELSE summary END");
-    binds.push(summarizeText(text));
+    //
+    // Skipped entirely when the caller named a summary: assigning the same
+    // column twice in one UPDATE is ambiguous at best, and the explicit value
+    // is the one that was asked for.
+    if (explicitSummary === null) {
+      sets.push("summary = CASE WHEN summary IS NULL OR summary = '' THEN ? ELSE summary END");
+      binds.push(summarizeText(text));
+    }
   }
 
   if (sets.length) {
@@ -611,6 +658,151 @@ async function getRawHtml(env, id) {
   });
 }
 
+// Tier 2 speech. §6 / V1-32
+//
+// Two routes: a manifest saying how many segments there are, and the audio for
+// one segment. Nothing is cached -- see worker/speech.js for why -- so this is
+// generated on the way to the reader and exists nowhere afterwards.
+
+// A day's ceiling on generation. MAX_SEGMENTS bounds one article; nothing
+// bounded a day, and the per-article figure is not what runs the allowance
+// down -- retrying a failed article from segment zero is. Free tier is 10,000
+// neurons/day and a segment is roughly 14, so 400 leaves comfortable room and
+// still covers far more listening than a day holds.
+//
+// Same shape as r2_usage_bytes: a `setting` row, incremented with one atomic
+// statement, because D1 is a single writer and a read-modify-write here would
+// lose counts exactly when the day is busiest. §5.2
+const AUDIO_DAY_LIMIT = 400;
+const AUDIO_DAY_KEY = 'audio_segments_day';
+const AUDIO_DAY_DATE = 'audio_segments_date';
+
+async function audioDayCount(env) {
+  const today = nowIso().slice(0, 10);
+  const rows = await env.DB.prepare(
+    `SELECT key, value FROM setting WHERE key IN (?1, ?2)`
+  ).bind(AUDIO_DAY_KEY, AUDIO_DAY_DATE).all();
+
+  const map = Object.fromEntries(rows.results.map((r) => [r.key, r.value]));
+  // A stale date means the count belongs to a day that is over.
+  if (map[AUDIO_DAY_DATE] !== today) return { used: 0, today };
+  const n = Number(map[AUDIO_DAY_KEY]);
+  return { used: Number.isFinite(n) && n > 0 ? n : 0, today };
+}
+
+async function bumpAudioDay(env, today) {
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    ).bind(AUDIO_DAY_DATE, today),
+    env.DB.prepare(
+      `INSERT INTO setting (key, value) VALUES (?1, '1')
+       ON CONFLICT(key) DO UPDATE SET value =
+         CAST(CASE WHEN (SELECT value FROM setting WHERE key = ?2) = ?3
+                   THEN CAST(setting.value AS INTEGER) + 1 ELSE 1 END AS TEXT)`
+    ).bind(AUDIO_DAY_KEY, AUDIO_DAY_DATE, today)
+  ]);
+}
+
+async function getAudioManifest(env, id) {
+  const row = await env.DB.prepare(
+    `SELECT title, source, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
+  ).bind(id, TOPIC_ID).first();
+  if (!row) return fail(404, 'No such article.');
+
+  if (!env.AI) {
+    // Not an error: the browser voice is the floor, and the client asks this
+    // question precisely so it can fall back without a failed request.
+    return json({ available: false, reason: 'Workers AI is not configured.', segments: 0 });
+  }
+
+  const segments = segmentText(speechText(row));
+  if (!segments.length) return json({ available: false, reason: 'Nothing to read aloud.', segments: 0 });
+
+  // A ceiling per article, so one very long paper cannot quietly spend the
+  // day's neurons. Truncating would be worse than refusing: it would read
+  // three quarters of something and stop without saying why.
+  if (segments.length > MAX_SEGMENTS) {
+    return json({
+      available: false,
+      reason: `Too long to read aloud (${segments.length} segments, limit ${MAX_SEGMENTS}).`,
+      segments: segments.length
+    });
+  }
+
+  const day = await audioDayCount(env);
+  if (day.used + segments.length > AUDIO_DAY_LIMIT) {
+    // Reported as unavailable rather than as an error: the client's answer to
+    // "no server audio" is already the browser voice, and this is the same
+    // answer for a different reason.
+    return json({
+      available: false,
+      reason: `Daily speech limit reached (${day.used} of ${AUDIO_DAY_LIMIT} segments). It resets at midnight UTC.`,
+      segments: segments.length
+    });
+  }
+
+  return json({
+    available: true,
+    segments: segments.length,
+    // Per-segment lengths, so the client can report progress proportional to
+    // the text rather than counting segments as equal -- the last one is often
+    // a fraction of the others.
+    segmentChars: segments.map((s) => s.length),
+    chars: segments.reduce((n, s) => n + s.length, 0),
+    title: row.title,
+    source: row.source
+  });
+}
+
+async function getAudioSegment(env, id, index) {
+  if (!env.AI) return fail(503, 'Workers AI is not configured.');
+
+  const row = await env.DB.prepare(
+    `SELECT title, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
+  ).bind(id, TOPIC_ID).first();
+  if (!row) return fail(404, 'No such article.');
+
+  const segments = segmentText(speechText(row));
+  if (segments.length > MAX_SEGMENTS) return fail(413, 'Too long to read aloud.');
+  // Out of range is a 404 rather than an empty 200: the client uses the end of
+  // the range to know it has finished, and an empty body would play as silence.
+  if (!Number.isInteger(index) || index < 0 || index >= segments.length) {
+    return fail(404, 'No such segment.');
+  }
+
+  // Checked again here, not only in the manifest: the manifest is one snapshot
+  // taken before a long listen, and the segment route is what actually spends.
+  const day = await audioDayCount(env);
+  if (day.used >= AUDIO_DAY_LIMIT) {
+    return fail(429, `Daily speech limit reached (${AUDIO_DAY_LIMIT} segments). It resets at midnight UTC.`);
+  }
+
+  let audio;
+  try {
+    // Counted before generating rather than after: a request that dies partway
+    // has still spent the neurons, and an uncounted failure is the one that
+    // would let a retry loop run the allowance down.
+    await bumpAudioDay(env, day.today);
+    audio = await generateSegment(env, segments[index]);
+  } catch (err) {
+    // The reader falls back to the browser voice on this, so it must be a
+    // clean failure rather than a hang or a half-written body.
+    return fail(502, `Speech generation failed: ${String(err?.message || err)}`);
+  }
+
+  return new Response(audio.body, {
+    headers: {
+      'content-type': audio.contentType,
+      // Private and brief. The audio is deterministic for a given text, but
+      // storing it is the thing this design exists to avoid, and a long cache
+      // here would just move the hoard into the browser.
+      'cache-control': 'private, max-age=600'
+    }
+  });
+}
+
 async function getArticle(env, id) {
   const row = await env.DB.prepare(
     `SELECT ${LIST_COLUMNS}, body_text FROM article WHERE id = ?1 AND topic_id = ?2`
@@ -708,7 +900,11 @@ async function ingestCandidates(env, request) {
   for (const item of items.slice(0, 50)) {
     const url = (item.url || '').trim();
     const normalized = item.url_normalized || url;
-    const title = (item.title || '').trim();
+    // RSS is XML, so `&amp;` is mandatory there and `&#8217;` ubiquitous.
+    // discover/ does no decoding by design -- it stays dependency-free -- so
+    // this is where it has to happen, or the Discover screen renders raw
+    // entities and any candidate promoted to an article carries them in. V1-30
+    const title = decodeEntities((item.title || '').trim());
     if (!url || !title) continue;
 
     statements.push(
@@ -722,9 +918,9 @@ async function ingestCandidates(env, request) {
         url,
         normalized,
         title,
-        (item.summary || '').slice(0, 500),
-        (item.source || '').slice(0, 200),
-        item.author || null,
+        decodeEntities((item.summary || '').trim()).slice(0, 500),
+        decodeEntities((item.source || '').trim()).slice(0, 200),
+        item.author ? decodeEntities(item.author) : null,
         item.published_at || null,
         item.score || 0,
         ts
@@ -903,7 +1099,14 @@ export default {
         if (candidateMatch[2] === 'skip') return await skipCandidate(env, id);
       }
 
-      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch|raw))?$/);
+      // Audio segments carry an index, so they are matched before the
+      // single-action pattern below.
+      const audioSeg = path.match(/^\/api\/articles\/(\d+)\/audio\/(\d+)$/);
+      if (audioSeg && request.method === 'GET') {
+        return await getAudioSegment(env, Number(audioSeg[1]), Number(audioSeg[2]));
+      }
+
+      const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch|raw|audio))?$/);
       if (match) {
         const id = Number(match[1]);
         const action = match[2];
@@ -915,6 +1118,7 @@ export default {
         if (action === 'star' && request.method === 'POST') return await setStar(env, id, request);
         if (action === 'refetch' && request.method === 'POST') return await refetchArticle(env, id);
         if (action === 'raw' && request.method === 'GET') return await getRawHtml(env, id);
+        if (action === 'audio' && request.method === 'GET') return await getAudioManifest(env, id);
         return fail(405, 'Method not allowed.');
       }
 

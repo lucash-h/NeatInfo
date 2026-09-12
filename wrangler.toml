@@ -9,6 +9,13 @@ directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
 
+# Tier 2 speech. Workers AI always runs remotely, even under `wrangler dev`,
+# so a local dev server still spends real neurons -- 10,000 a day are free.
+# Optional: delete this block and listening falls back to the browser's own
+# voice, which is what it used before. §6
+[ai]
+binding = "AI"
+
 # Metadata, body text, notes and events. Small, queryable, FTS5.
 [[d1_databases]]
 binding = "DB"

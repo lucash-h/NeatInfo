@@ -23,6 +23,37 @@
 
 const DEFAULT_BASE = 'http://localhost:8787';
 
+// The passphrase can come from the environment or from a gitignored .env
+// beside package.json, because typing it on every run is how it ends up in
+// shell history. .env is deliberately separate from .dev.vars: that file holds
+// the *local* secrets wrangler dev loads, and the production passphrase is a
+// different value that must not leak into a dev server.
+async function loadDotEnv(dir) {
+  const { readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  let text;
+  try {
+    text = await readFile(join(dir, '.env'), 'utf8');
+  } catch {
+    return {};
+  }
+  const out = {};
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq < 1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    // Strip one layer of matching quotes, so a passphrase with spaces works.
+    if (value.length > 1 && value[0] === value[value.length - 1] && (value[0] === '"' || value[0] === "'")) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
 function arg(args, name, fallback = null) {
   const i = args.indexOf(name);
   return i === -1 ? fallback : args[i + 1];
@@ -42,14 +73,23 @@ async function main() {
   --delay <ms>     pause between additions      (default 1500)
   --dry-run        list what would be added, add nothing
 
-The passphrase is read from NEATINFO_PASSPHRASE, never from a flag.`);
+The passphrase is read from NEATINFO_PASSPHRASE or from app/.env
+(gitignored), never from a flag.`);
     return;
   }
 
   const file = arg(args, '--file');
   if (!file) throw new Error('--file is required. See --help.');
 
-  const base = (arg(args, '--base', DEFAULT_BASE) || DEFAULT_BASE).replace(/\/+$/, '');
+  // .env is read before anything else needs it, so --base, NEATINFO_BASE and
+  // the default are resolved in one place: an explicit flag wins over the
+  // file, which wins over localhost.
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, join } = await import('node:path');
+  const appDir = join(dirname(fileURLToPath(import.meta.url)), '..');
+  const fromFile = await loadDotEnv(appDir);
+
+  const base = (arg(args, '--base') || fromFile.NEATINFO_BASE || DEFAULT_BASE).replace(/\/+$/, '');
   const delay = Number(arg(args, '--delay', '1500'));
   const limitArg = arg(args, '--limit');
   const dryRun = args.includes('--dry-run');
@@ -70,9 +110,13 @@ The passphrase is read from NEATINFO_PASSPHRASE, never from a flag.`);
     return;
   }
 
-  const passphrase = globalThis.process.env.NEATINFO_PASSPHRASE;
+  // An explicit environment variable wins, so a one-off run against a
+  // different instance does not need the file edited.
+  const passphrase = globalThis.process.env.NEATINFO_PASSPHRASE || fromFile.NEATINFO_PASSPHRASE;
   if (!passphrase) {
-    throw new Error('NEATINFO_PASSPHRASE is not set. Export it and re-run; it is deliberately not a flag.');
+    throw new Error(
+      'No passphrase. Put NEATINFO_PASSPHRASE=... in app/.env (gitignored), or set it in the environment.'
+    );
   }
 
   // One sign-in, then the signed cookie is reused for every add.
@@ -107,10 +151,18 @@ The passphrase is read from NEATINFO_PASSPHRASE, never from a flag.`);
       // first-class archive filter already, so provenance becomes something
       // you can actually query -- and later compare keep-rates across. §7.5
       if (res.status === 201 && payload.article?.id) {
+        const patch = { tags: [c.via] };
+        // Some hosts (openai.com among them) answer a plain fetch with a 403,
+        // so the item arrives with no text and a "<host> - untitled" title.
+        // The feed that found it already knew the title, and a row you cannot
+        // identify is one you will never go back to -- so supply it, but only
+        // when extraction failed. A successful fetch keeps the page's own
+        // title, which is canonical; a feed's is often editorialised.
+        if (payload.fetchError && c.title) patch.title = c.title;
         await fetch(`${base}/api/articles/${payload.article.id}`, {
           method: 'PATCH',
           headers: { 'content-type': 'application/json', cookie },
-          body: JSON.stringify({ tags: [c.via] })
+          body: JSON.stringify(patch)
         }).catch(() => {});
       }
 

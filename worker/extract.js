@@ -6,6 +6,62 @@ import { isArxivAbs } from './url.js';
 const SKIP = new Set(['script', 'style', 'noscript', 'nav', 'header', 'footer', 'aside', 'form', 'svg']);
 const BLOCKS = 'article p, article li, main p, main li, [role="main"] p, [role="main"] li, body p, body li';
 
+// HTMLRewriter hands back both attribute values and text chunks exactly as the
+// page wrote them -- it preserves source bytes, which is correct for a
+// streaming rewriter and is not what this extractor originally assumed. So
+// titles read `Ed Zitron&#39;s`, summaries read `&quot;best software&quot;`,
+// and bodies read `people&#8217;s heads`. Nothing was decoded anywhere. V1-30
+//
+// Not the full HTML5 table -- that is some two thousand names -- but every
+// entity that turns up in real article metadata. The punctuation set matters
+// most: WordPress emits `&rsquo;` and `&#8217;` interchangeably for the same
+// curly apostrophe, and `&mdash;`/`&hellip;` constantly. Anything not listed is
+// left visible rather than mangled, which is no worse than before.
+const NAMED = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+  rsquo: '’', lsquo: '‘', ldquo: '“', rdquo: '”',
+  mdash: '—', ndash: '–', hellip: '…',
+  // Added because the repair script's audit reported them surviving a decode
+  // over the real archive -- which is what that reporting is for. zwnj is a
+  // zero-width non-joiner used as a soft line-break hint; it decodes to an
+  // invisible character, so the text reads correctly either way, but leaving
+  // the literal "&zwnj;" visible does not.
+  larr: '←', rarr: '→', copy: '©', zwnj: '‌',
+  middot: '·', bull: '•', deg: '°', trade: '™',
+  reg: '®', laquo: '«', raquo: '»', times: '×'
+};
+
+// One pass, deliberately. The first version chained four .replace() calls with
+// `&amp;` last, reasoning that this stopped `&amp;#39;` becoming an apostrophe.
+// It did -- but only for that spelling. `&#38;` and `&#x26;` are also
+// ampersand, they were decoded by the earlier passes, and the raw `&` they
+// emitted was then rescanned by the later ones: `&#38;lt;` came out as `<`,
+// inventing a character the page never contained. A single pass cannot rescan
+// its own output, so the hazard stops being a matter of ordering.
+export function decodeEntities(value) {
+  if (typeof value !== 'string' || !value.includes('&')) return value;
+
+  return value.replace(
+    /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|([a-zA-Z]+));/g,
+    (whole, dec, hex, name) => {
+      if (name) return Object.prototype.hasOwnProperty.call(NAMED, name) ? NAMED[name] : whole;
+      const code = dec ? Number(dec) : parseInt(hex, 16);
+      return code > 0 && code <= 0x10ffff ? safeFromCode(code, whole) : whole;
+    }
+  );
+}
+
+function safeFromCode(code, whole) {
+  // Lone surrogates are not characters; String.fromCodePoint accepts them and
+  // produces text that breaks JSON encoding further down.
+  if (code >= 0xd800 && code <= 0xdfff) return whole;
+  try {
+    return String.fromCodePoint(code);
+  } catch {
+    return whole;
+  }
+}
+
 class Meta {
   constructor() {
     this.data = {};
@@ -26,7 +82,9 @@ class Meta {
       'article:published_time': 'published_at',
       'datepublished': 'published_at'
     }[prop];
-    if (keep && !this.data[keep]) this.data[keep] = content.trim();
+    // Decoded here, at the point of entry, so everything downstream --
+    // summarizeText, the body cap, the row itself -- sees real text. V1-30
+    if (keep && !this.data[keep]) this.data[keep] = decodeEntities(content).trim();
   }
 }
 
@@ -38,7 +96,7 @@ class Title {
   text(chunk) {
     this.buf += chunk.text;
     if (chunk.lastInTextNode && !this.target.data.title) {
-      this.target.data.title = this.buf.trim();
+      this.target.data.title = decodeEntities(this.buf).trim();
     }
   }
 }
@@ -54,7 +112,10 @@ class Body {
   element(el) {
     if (this.depth > 0) return;
     el.onEndTag(() => {
-      const text = this.current.replace(/\s+/g, ' ').trim();
+      // Decoded here rather than in text(): a chunk boundary can fall inside
+      // an entity ("&am" + "p;"), and by onEndTag the block is whole. The
+      // length floor is applied after decoding so it measures real characters.
+      const text = decodeEntities(this.current).replace(/\s+/g, ' ').trim();
       if (text.length > 40) this.parts.push(text);
       this.current = '';
     });
@@ -103,10 +164,12 @@ class ArxivMeta {
     const name = (el.getAttribute('name') || '').toLowerCase();
     const content = el.getAttribute('content');
     if (!content) return;
-    if (name === 'citation_title' && !this.title) this.title = content.trim();
-    else if (name === 'citation_author') this.authors.push(content.trim());
-    else if ((name === 'citation_date' || name === 'citation_online_date') && !this.date) this.date = content.trim();
-    else if (name === 'citation_abstract' && !this.abstract) this.abstract = content.trim();
+    // Same escaping applies to arXiv's citation_* tags. V1-30
+    const text = decodeEntities(content).trim();
+    if (name === 'citation_title' && !this.title) this.title = text;
+    else if (name === 'citation_author') this.authors.push(text);
+    else if ((name === 'citation_date' || name === 'citation_online_date') && !this.date) this.date = text;
+    else if (name === 'citation_abstract' && !this.abstract) this.abstract = text;
   }
 }
 
@@ -118,7 +181,7 @@ class Collect {
     this.buf += chunk.text;
   }
   get value() {
-    return this.buf.replace(/\s+/g, ' ').trim();
+    return decodeEntities(this.buf).replace(/\s+/g, ' ').trim();
   }
 }
 

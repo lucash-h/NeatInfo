@@ -418,3 +418,62 @@ describe('POST /api/articles/:id/refetch', () => {
     expect((await refetch(999999)).status).toBe(404);
   });
 });
+
+// V1-30. The unit tests in extract.test.js pin the decoder; these pin that it
+// is actually wired into the path a real page takes, for both the generic
+// extractor and the arXiv one.
+describe('HTML entities in metadata', () => {
+  it('decodes the title and summary taken from meta tags', async () => {
+    stubFetch(async () =>
+      htmlResponse(page({
+        meta: `<meta property="og:title" content="Ed Zitron&#39;s AI prediction track record">
+               <meta property="og:description" content="Three sites made 215,128 &quot;best software&quot; pages &amp; more.">
+               <meta property="og:site_name" content="Tom &amp; Jerry Review">
+               <meta name="author" content="A. Writer &amp; Co.">`
+      }))
+    );
+
+    const { body } = await add({ url: 'https://example.com/entities' });
+
+    expect(body.article.title).toBe("Ed Zitron's AI prediction track record");
+    expect(body.article.summary).toBe('Three sites made 215,128 "best software" pages & more.');
+    expect(body.article.source).toBe('Tom & Jerry Review');
+    expect(body.article.author).toBe('A. Writer & Co.');
+  });
+
+  it('decodes body text exactly once', async () => {
+    // HTMLRewriter does not decode text nodes either -- it preserves source
+    // bytes everywhere -- so the body needs the same treatment as the meta
+    // tags. The fixture is double-escaped on purpose: `&amp;amp;` must come
+    // back as `&amp;`, which fails if nothing decoded it AND fails if
+    // something decoded it twice.
+    stubFetch(async () =>
+      htmlResponse(page({ body: 'Tom &amp;amp; Jerry argued about escaping for a good long while.' }))
+    );
+
+    const { body } = await add({ url: 'https://example.com/body-entities' });
+    const row = await env.DB.prepare('SELECT body_text FROM article WHERE id = ?1')
+      .bind(body.article.id).first();
+
+    expect(row.body_text).toContain('Tom &amp; Jerry');
+    expect(row.body_text).not.toContain('Tom & Jerry');
+  });
+
+  it('decodes an arXiv paper title and abstract', async () => {
+    stubFetch(async () =>
+      htmlResponse(`<!doctype html><html><head>
+        <meta name="citation_title" content="On Gr&#246;bner bases &amp; their uses">
+        <meta name="citation_author" content="Ada L&#246;velace">
+        <meta name="citation_date" content="2026/02/03">
+        <meta name="citation_abstract" content="We study &quot;bases&quot; and show they&#39;re useful for a great many things indeed.">
+        </head><body></body></html>`)
+    );
+
+    const { body } = await add({ url: 'https://arxiv.org/abs/2602.01234' });
+
+    expect(body.article.title).toBe('On Gröbner bases & their uses');
+    expect(body.article.author).toBe('Ada Lövelace');
+    expect(body.article.summary).not.toContain('&quot;');
+    expect(body.article.summary).toContain('"bases"');
+  });
+});

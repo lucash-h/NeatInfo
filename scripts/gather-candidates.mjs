@@ -87,7 +87,12 @@ async function fromTldrAi({ limit }) {
   const html = await getText(TLDR_LATEST);
   const out = new Map();
 
-  for (const match of html.matchAll(/href="(https?:\/\/[^"]+)"/g)) {
+  // The anchor text is the headline TLDR wrote for the link. Worth taking:
+  // these pages are exactly the ones most likely to refuse a plain fetch (a
+  // paywall, a 403), and an item with no title and no text is one you will
+  // never go back to. The trailing "(4 minute read)" is theirs, not the
+  // article's, so it goes.
+  for (const match of html.matchAll(/<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
     const raw = match[1].replace(/&amp;/g, '&');
     let u;
     try {
@@ -97,7 +102,16 @@ async function fromTldrAi({ limit }) {
     }
     if (u.searchParams.get('utm_source') !== 'tldrai') continue;
     if (u.hostname.endsWith('tldr.tech')) continue;
-    if (!out.has(u.toString())) out.set(u.toString(), { url: u.toString(), via: 'tldr-ai', title: '' });
+
+    const title = match[2]
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
+      .replace(/\(\d+\s+(?:second|minute|min|hour)s?\s+read\)\s*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!out.has(u.toString())) out.set(u.toString(), { url: u.toString(), via: 'tldr-ai', title });
   }
 
   return [...out.values()].slice(0, limit);

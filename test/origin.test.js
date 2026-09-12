@@ -178,3 +178,123 @@ describe('ingest with origin and defer', () => {
     expect(second.body.duplicate).toBe(true);
   });
 });
+
+// D8 (V1-30). PATCH gained an explicit `summary` so the entity repair can fix
+// stored summaries. The guard it must NOT break is the derived one: pasting
+// text into a failed-fetch article fills an empty summary but never replaces
+// a summary you have already read.
+describe('explicit summary on PATCH', () => {
+  const patch = (id, payload) =>
+    callJson(`/api/articles/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+
+  it('overwrites an existing summary when one is named', async () => {
+    const { id } = await seedArticle({ summary: 'Meta&#039;s agent, escaped' });
+
+    const { body } = await patch(id, { summary: "Meta's agent, repaired" });
+
+    expect(body.article.summary).toBe("Meta's agent, repaired");
+  });
+
+  it('still refuses to overwrite a summary as a side effect of pasting text', async () => {
+    const { id } = await seedArticle({ summary: 'A summary you have read' });
+
+    await patch(id, { body_text: 'Some pasted article text that is long enough to summarize from.' });
+
+    const row = await env.DB.prepare('SELECT summary FROM article WHERE id = ?1').bind(id).first();
+    expect(row.summary).toBe('A summary you have read');
+  });
+
+  it('still fills an empty summary from pasted text', async () => {
+    const { id } = await seedArticle({ summary: '' });
+
+    await patch(id, { body_text: 'Some pasted article text that is long enough to summarize from.' });
+
+    const row = await env.DB.prepare('SELECT summary FROM article WHERE id = ?1').bind(id).first();
+    expect(row.summary).not.toBe('');
+  });
+
+  it('lets an explicit summary win when text is pasted in the same request', async () => {
+    // Both paths want to write `summary`; assigning one column twice in a
+    // single UPDATE is ambiguous, so the explicit value takes it.
+    const { id } = await seedArticle({ summary: '' });
+
+    const { body } = await patch(id, {
+      body_text: 'Some pasted article text that is long enough to summarize from.',
+      summary: 'The summary I actually want'
+    });
+
+    expect(body.article.summary).toBe('The summary I actually want');
+  });
+
+  it('ignores a summary that is not a string, rather than blanking the field', async () => {
+    const { id } = await seedArticle({ summary: 'unchanged' });
+
+    await patch(id, { summary: null });
+    await patch(id, { summary: 42 });
+
+    const row = await env.DB.prepare('SELECT summary FROM article WHERE id = ?1').bind(id).first();
+    expect(row.summary).toBe('unchanged');
+  });
+});
+
+// V1-30 review follow-ups. Each of these covers a route the repair script
+// needs and that nothing else exercises.
+describe('repair routes on PATCH', () => {
+  const patch = (id, payload) =>
+    callJson(`/api/articles/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+
+  it('writes author, which previously had no route in at all', async () => {
+    const { id } = await seedArticle({ author: 'A. Writer &amp; Co.' });
+
+    const { body } = await patch(id, { author: 'A. Writer & Co.' });
+
+    expect(body.article.author).toBe('A. Writer & Co.');
+  });
+
+  it('keeps fetch_status when a body is rewritten as a pure decode', async () => {
+    // The whole reason this flag exists: decoding entities must not relabel a
+    // fetched article as hand-pasted and destroy the provenance signal.
+    const { id } = await seedArticle({ fetch_status: 'ok', body_text: 'people&#8217;s heads' });
+
+    await patch(id, { body_text: "people's heads", keep_fetch_status: true });
+
+    const row = await env.DB.prepare(
+      'SELECT fetch_status, body_text, word_count FROM article WHERE id = ?1'
+    ).bind(id).first();
+    expect(row.fetch_status).toBe('ok');
+    expect(row.body_text).toBe("people's heads");
+    expect(row.word_count).toBe(2);
+  });
+
+  it('still marks a genuine paste as pasted when the flag is absent', async () => {
+    const { id } = await seedArticle({ fetch_status: 'failed' });
+
+    await patch(id, { body_text: 'Text a human pasted in by hand just now.' });
+
+    const row = await env.DB.prepare('SELECT fetch_status FROM article WHERE id = ?1').bind(id).first();
+    expect(row.fetch_status).toBe('pasted');
+  });
+
+  it('ignores an empty summary rather than blanking the field', async () => {
+    // Matches title and source. An edit form PATCHing {title, summary} with
+    // the summary box left empty must not destroy it.
+    const { id } = await seedArticle({ summary: 'worth keeping' });
+
+    await patch(id, { summary: '' });
+    await patch(id, { summary: '   ' });
+
+    const row = await env.DB.prepare('SELECT summary FROM article WHERE id = ?1').bind(id).first();
+    expect(row.summary).toBe('worth keeping');
+  });
+
+  it('decodes a caller-supplied title at ingest, since it outranks the extractor', async () => {
+    // discover/ produces RSS-derived titles, and RSS is XML, so entities are
+    // mandatory there rather than incidental.
+    const res = await callJson('/api/articles', {
+      method: 'POST',
+      body: JSON.stringify({ text: 'Some pasted text.', title: 'Meta&#039;s agent &amp; friends' })
+    });
+
+    expect(res.body.article.title).toBe("Meta's agent & friends");
+  });
+});
