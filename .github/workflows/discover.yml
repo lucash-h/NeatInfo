@@ -1,0 +1,22 @@
+name: Discover Articles
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch: {}       # manual trigger for testing
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run discovery pipeline
+        run: node discover/index.js
+        env:
+          NEATINFO_API_URL: ${{ secrets.NEATINFO_API_URL }}
+          NEATINFO_DISCOVER_KEY: ${{ secrets.NEATINFO_DISCOVER_KEY }}

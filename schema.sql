@@ -122,5 +122,65 @@ CREATE TRIGGER IF NOT EXISTS article_au AFTER UPDATE ON article BEGIN
   VALUES (new.id, new.title, new.summary, new.body_text, new.notes, new.source);
 END;
 
+-- ---------------------------------------------------------------- discovery
+
+CREATE TABLE IF NOT EXISTS feed_source (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  name            TEXT    NOT NULL,
+  url             TEXT    NOT NULL UNIQUE,
+  tier            INTEGER NOT NULL DEFAULT 2
+                  CHECK (tier IN (1, 2, 3)),
+  format          TEXT    NOT NULL DEFAULT 'rss'
+                  CHECK (format IN ('rss','atom','json','api')),
+  active          INTEGER NOT NULL DEFAULT 1,
+  last_fetched_at TEXT,
+  weight_modifier REAL    NOT NULL DEFAULT 1.0,
+  created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS candidate (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id        TEXT    NOT NULL,
+  feed_source_id  INTEGER REFERENCES feed_source(id),
+  url             TEXT    NOT NULL,
+  url_normalized  TEXT    NOT NULL,
+  title           TEXT    NOT NULL,
+  summary         TEXT    NOT NULL DEFAULT '',
+  source          TEXT    NOT NULL DEFAULT '',
+  author          TEXT,
+  published_at    TEXT,
+  score           REAL    NOT NULL DEFAULT 0,
+  status          TEXT    NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','kept','skipped')),
+  created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS candidate_url_unique
+  ON candidate(url_normalized) WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS candidate_batch
+  ON candidate(batch_id, status, score DESC);
+
+-- -------------------------------------------------------------------- seeds
+
 INSERT OR IGNORE INTO topic (id, name, active) VALUES (1, 'AI', 1);
 INSERT OR IGNORE INTO setting (key, value) VALUES ('lapse_window_days', '14');
+
+-- Tier 1: Lab blogs (primary announcements)
+INSERT OR IGNORE INTO feed_source (name, url, tier, format) VALUES
+  ('OpenAI Blog',       'https://openai.com/blog/rss.xml',                          1, 'rss'),
+  ('Anthropic Blog',    'https://www.anthropic.com/rss.xml',                         1, 'rss'),
+  ('Google DeepMind',   'https://deepmind.google/blog/rss.xml',                      1, 'rss'),
+  ('Meta AI Blog',      'https://ai.meta.com/blog/rss/',                             1, 'rss');
+
+-- Tier 2: Editorial (analysis, context)
+INSERT OR IGNORE INTO feed_source (name, url, tier, format) VALUES
+  ('TechCrunch AI',     'https://techcrunch.com/category/artificial-intelligence/feed/', 2, 'rss'),
+  ('The Verge AI',      'https://www.theverge.com/rss/ai-artificial-intelligence/index.xml', 2, 'rss'),
+  ('MIT Tech Review AI','https://www.technologyreview.com/topic/artificial-intelligence/feed/', 2, 'rss'),
+  ('Ars Technica AI',   'https://feeds.arstechnica.com/arstechnica/technology-lab',  2, 'rss');
+
+-- Tier 3: Community / research
+INSERT OR IGNORE INTO feed_source (name, url, tier, format) VALUES
+  ('Hacker News',       'https://hn.algolia.com/api/v1/search',                     3, 'api'),
+  ('arXiv cs.AI',       'https://rss.arxiv.org/rss/cs.AI',                          3, 'rss');

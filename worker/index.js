@@ -685,6 +685,177 @@ async function exportAll(env) {
   });
 }
 
+// -------------------------------------------------------------- discovery
+
+const CANDIDATE_COLUMNS = `id, batch_id, feed_source_id, url, url_normalized, title, summary, source, author, published_at, score, status, created_at`;
+
+function checkDiscoverKey(request, env) {
+  if (!env.DISCOVER_KEY) return false;
+  const header = request.headers.get('x-discover-key') || '';
+  return header.length > 0 && header === env.DISCOVER_KEY;
+}
+
+async function ingestCandidates(env, request) {
+  const body = await request.json().catch(() => ({}));
+  const items = body.candidates;
+  if (!Array.isArray(items) || !items.length) return fail(400, 'No candidates provided.');
+
+  const batchId = body.batchId || crypto.randomUUID();
+  const ts = nowIso();
+  let inserted = 0;
+
+  const statements = [];
+  for (const item of items.slice(0, 50)) {
+    const url = (item.url || '').trim();
+    const normalized = item.url_normalized || url;
+    const title = (item.title || '').trim();
+    if (!url || !title) continue;
+
+    statements.push(
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO candidate
+           (batch_id, feed_source_id, url, url_normalized, title, summary, source, author, published_at, score, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`
+      ).bind(
+        batchId,
+        item.feed_source_id || null,
+        url,
+        normalized,
+        title,
+        (item.summary || '').slice(0, 500),
+        (item.source || '').slice(0, 200),
+        item.author || null,
+        item.published_at || null,
+        item.score || 0,
+        ts
+      )
+    );
+    inserted++;
+  }
+
+  if (statements.length) await env.DB.batch(statements);
+
+  return json({ batchId, inserted }, { status: 201 });
+}
+
+async function getCandidates(env) {
+  const latestBatch = await env.DB.prepare(
+    `SELECT batch_id FROM candidate WHERE status = 'pending' ORDER BY created_at DESC LIMIT 1`
+  ).first();
+
+  if (!latestBatch) return json({ candidates: [], batchId: null, total: 0 });
+
+  const { results } = await env.DB.prepare(
+    `SELECT ${CANDIDATE_COLUMNS} FROM candidate
+     WHERE batch_id = ?1 AND status = 'pending'
+     ORDER BY score DESC`
+  ).bind(latestBatch.batch_id).all();
+
+  const total = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM candidate WHERE status = 'pending'`
+  ).first();
+
+  return json({ candidates: results, batchId: latestBatch.batch_id, total: total?.n ?? 0 });
+}
+
+async function keepCandidate(env, id) {
+  const row = await env.DB.prepare(
+    `SELECT ${CANDIDATE_COLUMNS} FROM candidate WHERE id = ?1 AND status = 'pending'`
+  ).bind(id).first();
+  if (!row) return fail(404, 'Candidate not found or already resolved.');
+
+  const existing = await env.DB.prepare(
+    `SELECT id FROM article WHERE topic_id = ?1 AND url_normalized = ?2`
+  ).bind(TOPIC_ID, row.url_normalized).first();
+
+  if (existing) {
+    await env.DB.prepare(`UPDATE candidate SET status = 'kept' WHERE id = ?1`).bind(id).run();
+    return json({ article: { id: existing.id }, alreadyExists: true });
+  }
+
+  const extracted = await extractArticle(row.url_normalized);
+  const ts = nowIso();
+
+  let record;
+  let fetchError = null;
+
+  if (extracted.ok) {
+    record = {
+      title: extracted.title || row.title,
+      source: extracted.source || row.source || sourceFromUrl(row.url_normalized),
+      author: extracted.author || row.author,
+      published_at: extracted.published_at || row.published_at,
+      summary: extracted.summary || row.summary,
+      body_text: extracted.body_text,
+      word_count: extracted.word_count,
+      fetch_status: 'ok',
+      raw_html_key: null,
+    };
+    if (env.RAW && extracted.html) {
+      record.raw_html_key = await captureRaw(env, extracted.html);
+    }
+  } else {
+    fetchError = extracted.error;
+    record = {
+      title: row.title,
+      source: row.source || sourceFromUrl(row.url_normalized),
+      author: row.author,
+      published_at: row.published_at,
+      summary: row.summary,
+      body_text: null,
+      word_count: 0,
+      fetch_status: extracted.fetch_status,
+      raw_html_key: null,
+    };
+  }
+
+  const inserted = await env.DB.prepare(
+    `INSERT INTO article
+       (topic_id, url, url_normalized, title, source, author, published_at,
+        body_text, summary, raw_html_key, added_at, word_count, fetch_status, fetched_at, origin)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'auto')
+     RETURNING ${LIST_COLUMNS}`
+  ).bind(
+    TOPIC_ID, row.url, row.url_normalized, record.title, record.source, record.author,
+    record.published_at, record.body_text, record.summary, record.raw_html_key,
+    ts, record.word_count, record.fetch_status, ts
+  ).first();
+
+  await env.DB.batch([
+    env.DB.prepare(`INSERT INTO event (article_id, type, created_at) VALUES (?1, 'added', ?2)`).bind(inserted.id, ts),
+    env.DB.prepare(`UPDATE candidate SET status = 'kept' WHERE id = ?1`).bind(id),
+  ]);
+
+  return json({ article: shape(inserted), fetchError }, { status: 201 });
+}
+
+async function skipCandidate(env, id) {
+  const { changes } = await env.DB.prepare(
+    `UPDATE candidate SET status = 'skipped' WHERE id = ?1 AND status = 'pending'`
+  ).bind(id).run();
+  if (!changes) return fail(404, 'Candidate not found or already resolved.');
+  return json({ ok: true });
+}
+
+async function batchResolveCandidates(env, request) {
+  const body = await request.json().catch(() => ({}));
+  const actions = body.actions;
+  if (!Array.isArray(actions) || !actions.length) return fail(400, 'No actions provided.');
+
+  const results = [];
+  for (const { id, action } of actions.slice(0, 50)) {
+    if (action === 'keep') {
+      const res = await keepCandidate(env, id);
+      const data = await res.json();
+      results.push({ id, action, ...data });
+    } else if (action === 'skip') {
+      await skipCandidate(env, id);
+      results.push({ id, action, ok: true });
+    }
+  }
+  return json({ results });
+}
+
 // ------------------------------------------------------------------ router
 
 export default {
@@ -707,6 +878,12 @@ export default {
       return fail(405, 'Method not allowed.');
     }
 
+    // Discovery script authenticates with a shared key, not a cookie.
+    if (path === '/api/candidates' && request.method === 'POST') {
+      if (!checkDiscoverKey(request, env)) return fail(401, 'Invalid discover key.');
+      return await ingestCandidates(env, request);
+    }
+
     if (!(await isAuthed(request, env))) return fail(401, 'Not signed in.');
 
     try {
@@ -715,6 +892,16 @@ export default {
       if (path === '/api/articles' && request.method === 'POST') return await addArticle(env, request);
       if (path === '/api/settings') return await settings(env, request);
       if (path === '/api/export' && request.method === 'GET') return await exportAll(env);
+
+      if (path === '/api/candidates' && request.method === 'GET') return await getCandidates(env);
+      if (path === '/api/candidates/batch' && request.method === 'POST') return await batchResolveCandidates(env, request);
+
+      const candidateMatch = path.match(/^\/api\/candidates\/(\d+)\/(keep|skip)$/);
+      if (candidateMatch) {
+        const id = Number(candidateMatch[1]);
+        if (candidateMatch[2] === 'keep') return await keepCandidate(env, id);
+        if (candidateMatch[2] === 'skip') return await skipCandidate(env, id);
+      }
 
       const match = path.match(/^\/api\/articles\/(\d+)(?:\/(open|listen|resolve|star|refetch|raw))?$/);
       if (match) {
