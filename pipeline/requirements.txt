@@ -1,0 +1,6 @@
+# Stage 1 needs nothing at runtime: it is regex and arithmetic over text, and
+# urllib is in the standard library. Keeping it that way is deliberate -- a
+# nightly job with no install step cannot break on a dependency.
+#
+# pytest is for the tests, which do not run in production.
+pytest>=8.0

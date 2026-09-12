@@ -948,11 +948,28 @@ async function putPipelineFeatures(env, request) {
   if (!version) return fail(400, 'A version is required.');
   if (!Array.isArray(rows) || !rows.length) return fail(400, 'No features provided.');
 
+  // Which of these articles actually exist. The foreign key would catch an
+  // orphan in production, but D1's enforcement is configuration rather than
+  // something this code controls -- and a feature row for an article that was
+  // never there is a silent wrong answer either way. One query settles it.
+  const wanted = [...new Set(rows.map((r) => Number(r.article_id)).filter(Number.isInteger))];
+  const known = new Set();
+  for (let i = 0; i < wanted.length; i += BIND_CHUNK) {
+    const chunk = wanted.slice(i, i + BIND_CHUNK);
+    if (!chunk.length) break;
+    const { results } = await env.DB.prepare(
+      `SELECT id FROM article WHERE topic_id = ?1 AND id IN (${chunk.map(() => '?').join(',')})`
+    ).bind(TOPIC_ID, ...chunk).all();
+    for (const r of results) known.add(r.id);
+  }
+
   const statements = [];
   let accepted = 0;
+  let skipped = 0;
   for (const row of rows.slice(0, 200)) {
     const id = Number(row.article_id);
     if (!Number.isInteger(id)) continue;
+    if (!known.has(id)) { skipped += 1; continue; }
     statements.push(
       env.DB.prepare(
         `INSERT INTO article_feature (article_id, version, score, explain, payload, computed_at)
@@ -970,7 +987,7 @@ async function putPipelineFeatures(env, request) {
     );
     accepted += 1;
   }
-  if (!accepted) return fail(400, 'No usable features provided.');
+  if (!accepted) return fail(400, `No usable features provided.${skipped ? ` ${skipped} referenced an article that does not exist.` : ''}`);
 
   // The canary. A nightly job that quietly stops is invisible for a week --
   // §9.6, and the shape of failure this project has already met twice. The
@@ -992,7 +1009,7 @@ async function putPipelineFeatures(env, request) {
   );
 
   await env.DB.batch(statements);
-  return json({ accepted, version });
+  return json({ accepted, skipped, version });
 }
 
 async function ingestCandidates(env, request) {

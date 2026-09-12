@@ -23,7 +23,8 @@ export default defineConfig({
         // in production (`wrangler secret put`).
         bindings: {
           PASSPHRASE: 'test-passphrase',
-          SESSION_SECRET: 'test-session-secret'
+          SESSION_SECRET: 'test-session-secret',
+          DISCOVER_KEY: 'test-discover-key'
         }
       }
     })
