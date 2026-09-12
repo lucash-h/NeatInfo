@@ -151,10 +151,18 @@ The passphrase is read from NEATINFO_PASSPHRASE or from app/.env
       // first-class archive filter already, so provenance becomes something
       // you can actually query -- and later compare keep-rates across. §7.5
       if (res.status === 201 && payload.article?.id) {
+        const patch = { tags: [c.via] };
+        // Some hosts (openai.com among them) answer a plain fetch with a 403,
+        // so the item arrives with no text and a "<host> - untitled" title.
+        // The feed that found it already knew the title, and a row you cannot
+        // identify is one you will never go back to -- so supply it, but only
+        // when extraction failed. A successful fetch keeps the page's own
+        // title, which is canonical; a feed's is often editorialised.
+        if (payload.fetchError && c.title) patch.title = c.title;
         await fetch(`${base}/api/articles/${payload.article.id}`, {
           method: 'PATCH',
           headers: { 'content-type': 'application/json', cookie },
-          body: JSON.stringify({ tags: [c.via] })
+          body: JSON.stringify(patch)
         }).catch(() => {});
       }
 
