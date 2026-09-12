@@ -23,10 +23,10 @@ app/
 │                     # Reader, TtsPlayer, ArticleCard, ArchiveRow,
 │                     # AddSheet, SettingsSheet, Shortcuts, Toast
 ├── pipeline/         # V2 scoring pipeline, Python (GitHub Actions, nightly)
-│                     #   NOT YET BUILT -- this is V1-33's target layout
 │   ├── features.py   # Stage 1 heuristics: counting over text + raw HTML
-│   ├── client.py     # pulls via /api/export, pushes features back
-│   └── requirements.txt
+│   ├── client.py     # pulls /api/pipeline/work, pushes features back
+│   ├── test_features.py       # pytest; run: python -m pytest pipeline/ -q
+│   └── README.md     # what each signal proxies for, and what would disprove it
 ├── discover/         # V2 discovery pipeline, JS (GitHub Actions, every 6h)
 │   ├── index.js      # Orchestrator: fetch → dedup → score → POST
 │   ├── rss.js        # RSS/Atom parser (zero deps)
@@ -45,12 +45,13 @@ app/
 ├── test/             # vitest, running inside workerd
 ├── vitest.config.js  # @cloudflare/vitest-pool-workers, bindings from wrangler.toml
 ├── .env.example      # copy to .env for the seeding scripts (gitignored)
-├── wrangler.toml     # D1 + R2 bindings, SPA routing
+├── wrangler.toml     # D1 + R2 + AI bindings, SPA routing
+├── wrangler.test.toml  # generated: wrangler.toml minus [ai]; see below
 ├── vite.config.js    # React plugin, /api proxy to wrangler in dev
 └── .github/workflows/
     ├── deploy.yml    # CI: test → build → D1 migrate → wrangler deploy
     ├── discover.yml  # Cron every 6h: run discovery pipeline
-    └── pipeline.yml   # Cron nightly: Stage 1 features (V1-33, not yet built)
+    └── pipeline.yml   # Cron nightly: Stage 1 features
 ```
 
 ## Architecture decisions
@@ -79,7 +80,14 @@ Or just Wrangler (serves built assets from dist/):
 cd app && npm run build && npx wrangler dev
 ```
 
-Run tests: `cd app && npm test`
+Run tests: `cd app && npm test` (JS) and `python -m pytest pipeline/ -q` (Python)
+
+**Workers AI has no local mode.** Declaring the `[ai]` binding makes both
+`vitest` and `wrangler dev` open a remote proxy session requiring
+`CLOUDFLARE_API_TOKEN` — so tests and local dev use `wrangler.test.toml`, which
+is `wrangler.toml` with that block removed. It is *generated*: regenerate with
+`node scripts/sync-test-config.mjs --write`, and CI fails if it has drifted. For
+a local worker without AI: `npx wrangler dev -c wrangler.test.toml`.
 
 Tests run inside **workerd**, not Node, so HTMLRewriter, D1 and R2 behave as in production. The pool shares one D1 file across tests — `resetDb()` in `test/helpers.js`, called in `beforeEach`, is what makes them independent.
 
